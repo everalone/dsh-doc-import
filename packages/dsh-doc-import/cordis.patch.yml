@@ -1,0 +1,14 @@
+# dsh-doc-import bundle patch: inserts the doc-import plugin row into the
+# web profile roster. Applied as a profile bundle layer (the `dsh.bundle.patch`
+# manifest field); install with:
+#
+#   dsh plugin --profile web add link:./packages/dsh-doc-import
+#
+# One package, both halves: the node half (exports ".") runs in the host
+# process and registers the /doc-import/* routes, the read_document tool, and
+# the "doc-import" settings section; the browser half (declared by `dsh.client`,
+# served from lib/client.js) provides the composer import button, the document
+# chip dock, document-level drop/paste, and the send-time inline hook.
+- insert:
+    - id: doc-import
+      name: dsh-doc-import

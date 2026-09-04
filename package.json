@@ -1,0 +1,21 @@
+{
+  "name": "dsh-doc-import",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.22.0",
+  "scripts": {
+    "build": "pnpm -C packages/dsh-doc-import build",
+    "watch": "pnpm -C packages/dsh-doc-import watch",
+    "typecheck": "pnpm -C packages/dsh-doc-import typecheck",
+    "link:core": "node scripts/link-core.mjs",
+    "test": "pnpm -C packages/dsh-doc-import test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "js-yaml": "^5.4.1",
+    "react": "^18.3.1",
+    "typescript": "^5.6.3"
+  },
+  "description": "dsh web 文档导入插件（dsh-doc-import）：拖入 txt/md/csv/docx/pdf 自动解析，扫描版 PDF 自动 OCR，对话中呈现为文件卡片，全文经 read_document 回读。"
+}
