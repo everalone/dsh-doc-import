@@ -14,13 +14,13 @@ export const DOC_IMPORT_SETTINGS_NAMESPACE = 'doc-import'
 export interface DocImportConfig {
   /** Inline cap in characters: longer documents are truncated in the message. */
   inlineCap: number
-  /** Above this many inlined characters the client shows a token/cost notice. */
+  /** Reserved field (ADR 0002): no inline cost notice exists in the reference-only flow. */
   costNoticeThreshold: number
   /** Upload byte bound for one document. */
   maxUploadBytes: number
   /** Hard page bound: PDFs beyond this are rejected. */
   maxPdfPages: number
-  /** CSV rows beyond this are not inlined (the full text stays in storage). */
+  /** CSV row count above which a "use read_document paging" warning is emitted; the full table is always stored. */
   maxInlineTableRows: number
   /** OCR switches on automatically for pages without a text layer. */
   ocrEnabled: boolean

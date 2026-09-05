@@ -1,7 +1,7 @@
 {
   "name": "dsh-doc-import",
   "version": "0.1.0",
-  "description": "dsh web GUI 文档导入插件：拖入/粘贴/选择 txt/md/csv/docx/pdf，host 端自动解析文本并内联进用户消息；扫描版 PDF 逐页自动 OCR（deepseek-v4-flash-vision-exp）；超限截断 + read_document 工具回读全文；>50k 字符发送前弹预计 token/费用提示。",
+  "description": "dsh web GUI 文档导入插件：拖入/粘贴/选择 txt/md/csv/docx/pdf，host 端解析并存储，消息只携带紧凑文件引用，模型经 read_document 工具按 id 回读全文；扫描版 PDF 逐页自动 OCR 回退（deepseek-v4-flash-vision-exp，可配任意 OpenAI 兼容视觉端点）。",
   "type": "module",
   "license": "MIT",
   "engines": {

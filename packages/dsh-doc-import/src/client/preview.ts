@@ -17,7 +17,7 @@
  * @module dsh-doc-import/client/preview
  */
 
-import { getDocImportLanguage, type DocImportClientKey } from './locales.js'
+import { dictionaries, getDocImportLanguage, type DocImportClientKey } from './locales.js'
 
 /** Matches one `[document … id: <sha256>]` reference inside message text. */
 const REFERENCE_PATTERN = /\[document ([^\]\n]+?), id: ([0-9a-f]{64})\]/g
@@ -69,25 +69,10 @@ function iconFor(kind: string): string {
   }
 }
 
+/** Resolve a locale key from the shared namespace dictionaries (zh/en). */
 function t(key: DocImportClientKey, vars?: Record<string, string | number>): string {
   const lang = getDocImportLanguage()
-  const table: Record<string, string> = lang === 'zh'
-    ? {
-        'file.open': '打开文档',
-        'file.openOriginal': '打开原始文件',
-        'file.close': '关闭',
-        'file.loading': '加载中…',
-        'file.failed': '加载失败：{error}',
-        'file.chars': '{chars} 字符',
-      }
-    : {
-        'file.open': 'Open document',
-        'file.openOriginal': 'Open original file',
-        'file.close': 'Close',
-        'file.loading': 'Loading…',
-        'file.failed': 'Failed: {error}',
-        'file.chars': '{chars} chars',
-      }
+  const table = dictionaries[lang] as Record<string, string>
   let text = table[key] ?? key
   if (vars !== undefined) {
     for (const [name, value] of Object.entries(vars)) text = text.replaceAll(`{${name}}`, String(value))
@@ -190,41 +175,68 @@ function openModal(docId: string, title: string): void {
   document.addEventListener('keydown', onKey)
   ;(overlay as unknown as { __onKey: (event: KeyboardEvent) => void }).__onKey = onKey
 
-  void fetch(`/doc-import/status?id=${encodeURIComponent(docId)}`)
-    .then(async (response) => {
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      return await response.json() as { ok: boolean; doc?: { name: string; kind: string; phase: string; chars: number; text?: string; cost?: { label: string }; warning?: string } }
-    })
-    .then((payload) => {
-      if (!payload.ok || payload.doc === undefined) throw new Error('status failed')
-      const doc = payload.doc
-      metaEl.textContent = `${doc.kind} · ${t('file.chars', { chars: doc.chars })}${doc.cost !== undefined ? ` · ${doc.cost.label}` : ''}`
-      if (doc.warning !== undefined && doc.warning.length > 0) {
-        const warning = document.createElement('div')
-        warning.textContent = doc.warning
-        warning.style.cssText = 'color:var(--dsw-alias-label-warning, #f5a524);font-size:12px;margin:0 0 8px;'
-        body.append(warning)
+  interface StatusDoc {
+    kind: string
+    chars: number
+    text?: string
+    cost?: { label: string }
+    warning?: string
+  }
+
+  const load = async (): Promise<StatusDoc> => {
+    const response = await fetch(`/doc-import/status?id=${encodeURIComponent(docId)}`)
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const payload = await response.json() as { ok: boolean; doc?: StatusDoc }
+    if (!payload.ok || payload.doc === undefined) throw new Error('status failed')
+    return payload.doc
+  }
+
+  const render = (doc: StatusDoc): void => {
+    metaEl.textContent = `${doc.kind} · ${t('file.chars', { chars: doc.chars })}${doc.cost !== undefined ? ` · ${doc.cost.label}` : ''}`
+    const warningText = doc.warning
+    body.textContent = ''
+    if (warningText !== undefined && warningText.length > 0) {
+      const warning = document.createElement('div')
+      warning.textContent = warningText
+      warning.style.cssText = 'color:var(--dsw-alias-label-warning, #f5a524);font-size:12px;margin:0 0 8px;'
+      body.append(warning)
+    }
+    if (doc.text !== undefined) {
+      const pre = document.createElement('pre')
+      pre.textContent = doc.text
+      pre.style.cssText = 'margin:0;white-space:pre-wrap;word-break:break-word;font:12.5px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;color:inherit;'
+      body.append(pre)
+    } else {
+      const empty = document.createElement('div')
+      empty.textContent = t('file.loading')
+      empty.style.cssText = 'color:var(--dsw-alias-label-secondary, #999);font-size:13px;'
+      body.append(empty)
+    }
+  }
+
+  /** Poll while OCR is pending so a mid-job open converges instead of sticking on "加载中…". */
+  const pollUntilText = async (): Promise<void> => {
+    for (;;) {
+      let doc: StatusDoc
+      try {
+        doc = await load()
+      } catch (error: unknown) {
+        body.textContent = ''
+        const failed = document.createElement('div')
+        failed.textContent = t('file.failed', { error: (error as Error)?.message ?? String(error) })
+        failed.style.cssText = 'color:var(--dsw-alias-label-danger, #e5484d);font-size:13px;'
+        body.append(failed)
+        return
       }
-      body.textContent = ''
-      if (doc.text !== undefined) {
-        const pre = document.createElement('pre')
-        pre.textContent = doc.text
-        pre.style.cssText = 'margin:0;white-space:pre-wrap;word-break:break-word;font:12.5px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;color:inherit;'
-        body.append(pre)
-      } else {
-        const empty = document.createElement('div')
-        empty.textContent = t('file.loading')
-        empty.style.cssText = 'color:var(--dsw-alias-label-secondary, #999);font-size:13px;'
-        body.append(empty)
-      }
-    })
-    .catch((error: unknown) => {
-      body.textContent = ''
-      const failed = document.createElement('div')
-      failed.textContent = t('file.failed', { error: (error as Error)?.message ?? String(error) })
-      failed.style.cssText = 'color:var(--dsw-alias-label-danger, #e5484d);font-size:13px;'
-      body.append(failed)
-    })
+      // Modal closed while polling: stop.
+      if (document.querySelector(`[${MODAL_ATTR}]`) === null) return
+      render(doc)
+      if (doc.text !== undefined) return
+      await new Promise((resolve) => setTimeout(resolve, 2_000))
+    }
+  }
+
+  void pollUntilText()
 }
 
 function closeModal(): void {

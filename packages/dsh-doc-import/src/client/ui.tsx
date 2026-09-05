@@ -1,9 +1,8 @@
 /**
  * Client surface: the composer import button (conversation.input.left), the
- * document chip dock above the composer (conversation.input.dock), the
- * document-level drop/paste listeners, and the non-blocking cost toast.
- * Components stay pure props + the module draft registry; the t prop comes
- * from the slot locale namespace.
+ * document chip dock above the composer (conversation.input.dock), and the
+ * document-level drop/paste listeners. Components stay pure props + the
+ * module draft registry; the t prop comes from the slot locale namespace.
  * @module dsh-doc-import/client/ui
  */
 
@@ -96,9 +95,6 @@ function DocChip({ doc, t }: { doc: DraftDoc; t: SlotProps['t'] }): ReactElement
         <span style={nameStyle}>{doc.name}</span>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
           <span style={metaStyle}>{statusLine(doc, t)}</span>
-          {doc.cost !== undefined && doc.status === 'ready' && (
-            <span style={{ color: 'var(--muted, #8e8ea0)' }}>{t('chip.cost', { label: doc.cost.label })}</span>
-          )}
         </div>
       </div>
       <button
@@ -171,31 +167,6 @@ export function ImportButton({ t }: SlotProps): ReactElement {
       📄 {t('button.title')}
     </button>
   )
-}
-
-let toastElement: HTMLDivElement | null = null
-let toastTimer: ReturnType<typeof setTimeout> | undefined
-
-function ensureToastRoot(): HTMLDivElement {
-  if (toastElement !== null && document.body.contains(toastElement)) return toastElement
-  const element = document.createElement('div')
-  element.style.cssText = 'position:fixed;bottom:96px;left:50%;transform:translateX(-50%);z-index:2147483000;background:rgba(24,24,32,.92);color:#eee;border:1px solid rgba(255,255,255,.15);border-radius:10px;padding:10px 16px;font-size:13px;line-height:1.5;max-width:min(560px,90vw);box-shadow:0 8px 28px rgba(0,0,0,.35);pointer-events:none;transition:opacity .25s;opacity:0;white-space:pre-wrap;'
-  document.body.appendChild(element)
-  toastElement = element
-  return element
-}
-
-/** Non-blocking cost notice, auto-dismissed after 8 seconds. */
-export function showCostToast(chars: number, tokens: number, cny: number, ocrCny: number): void {
-  const element = ensureToastRoot()
-  const cnyText = cny < 0.01 ? `¥${cny.toFixed(4)}` : `¥${cny.toFixed(2)}`
-  const ocrText = ocrCny > 0 ? `（含 OCR 预计 ${ocrCny < 0.01 ? `¥${ocrCny.toFixed(4)}` : `¥${ocrCny.toFixed(2)}`}）` : ''
-  element.textContent = `📄 本次内联文档约 ${chars.toLocaleString()} 字符 ≈ ${tokens.toLocaleString()} tokens ≈ ${cnyText}${ocrText}（按输入价估算，非阻断提示）`
-  element.style.opacity = '1'
-  if (toastTimer !== undefined) clearTimeout(toastTimer)
-  toastTimer = setTimeout(() => {
-    if (toastElement !== null) toastElement.style.opacity = '0'
-  }, 8_000)
 }
 
 /** Document-level drop and paste listeners; never claims image files. */

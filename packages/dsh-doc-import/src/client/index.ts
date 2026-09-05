@@ -82,15 +82,9 @@ function applyImpl(ctx: ClientContext): void {
     return () => observer.disconnect()
   }, 'doc-import: language mirror')
 
-  // Cost-notice threshold, read per send from the settings scope when bound.
-  let settingsScopeRef: DocImportSettingsScope | undefined
-
   ctx.inject(['slots', 'conversation'], (scope) => {
     try {
-      installSendHook(scope.conversation, () => {
-        const snapshot = settingsScopeRef?.getSnapshot()
-        return typeof snapshot?.value?.costNoticeThreshold === 'number' ? snapshot.value.costNoticeThreshold : undefined
-      })
+      installSendHook(scope.conversation)
     } catch (error) {
       console.warn('[doc-import] send hook install failed:', error)
     }
@@ -139,7 +133,6 @@ function applyImpl(ctx: ClientContext): void {
           set: (field, value) => bound.set(field, value),
           unset: (field) => bound.unset(field),
         }
-        settingsScopeRef = settingsScope
         const makeCard = () => createDocImportSettingsCard(settingsScope)
         try {
           scope.slots.inject('settings.plugin.item', () => {

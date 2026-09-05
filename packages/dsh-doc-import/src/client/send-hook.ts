@@ -18,13 +18,15 @@ import { clearReadyDrafts, getDrafts } from './state.js'
 
 const HOOK_MARKER = '__dshDocImportSendHooked'
 
+/** Upper bound for waiting on pending OCR before the send proceeds anyway. */
+const READY_WAIT_MS = 120_000
+
 interface ConversationSendFace {
   sendSession(session: unknown, text: string, imageIds: readonly string[], mode: string, signal?: AbortSignal): Promise<unknown>
 }
 
 export function installSendHook(
   conversation: unknown,
-  _readThreshold?: () => number | undefined,
 ): void {
   const face = conversation as ConversationSendFace & Record<string, unknown>
   if (face === null || typeof face !== 'object') return
@@ -39,7 +41,13 @@ export function installSendHook(
       return original.call(face, session, text, imageIds, mode, signal)
     }
     try {
-      await Promise.all(candidates.map((doc) => doc.ready))
+      // Never hang a send on a stalled job: after the wait budget the send
+      // proceeds with whatever references are ready (the model can still
+      // read_document the full text once OCR finishes).
+      await Promise.race([
+        Promise.all(candidates.map((doc) => doc.ready)),
+        new Promise<void>((resolve) => setTimeout(resolve, READY_WAIT_MS)),
+      ])
     } catch {
       // Individual docs already settled into the error state.
     }

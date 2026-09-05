@@ -42,9 +42,9 @@ const FIELDS: readonly FieldDef[] = [
   // ---- 文档导入 ----
   { key: 'inlineCap', label: '内联字符上限', kind: 'number', group: 'doc', step: '1000', min: 1000, hint: '保留字段：纯文件引用模式下不再内联正文' },
   { key: 'costNoticeThreshold', label: '费用提示阈值（字符）', kind: 'number', group: 'doc', step: '1000', min: 100, hint: '保留字段：正文改为文件引用后无内联费用提示' },
-  { key: 'maxUploadBytes', label: '上传上限（MiB）', kind: 'number', group: 'doc', step: '1', min: 1, hint: '单个文档字节上限', toDisplay: (v) => v / MiB, fromDisplay: (v) => Math.round(v * MiB) },
+  { key: 'maxUploadBytes', label: '文档大小上限（MiB）', kind: 'number', group: 'doc', step: '1', min: 1, hint: '单个文档字节上限', toDisplay: (v) => v / MiB, fromDisplay: (v) => Math.round(v * MiB) },
   { key: 'maxPdfPages', label: 'PDF 页数上限', kind: 'number', group: 'doc', step: '100', min: 1 },
-  { key: 'maxInlineTableRows', label: 'CSV 解析行数', kind: 'number', group: 'doc', step: '100', min: 1, hint: '超出部分存全文，可经 read_document 回读' },
+  { key: 'maxInlineTableRows', label: 'CSV 预警行数', kind: 'number', group: 'doc', step: '100', min: 1, hint: 'CSV 全文始终入库、可经 read_document 回读；超过该行数仅在警告中提示' },
   // ---- OCR ----
   { key: 'ocrEnabled', label: '自动 OCR 扫描页', kind: 'boolean', group: 'ocr', hint: '无文本层/空白页自动转图识别' },
   { key: 'ocrPageCap', label: '单文档 OCR 页数上限', kind: 'number', group: 'ocr', step: '10', min: 0, hint: '0 = 不限；超出的页跳过并警告' },
@@ -70,7 +70,7 @@ const FIELDS: readonly FieldDef[] = [
 
 const GROUP_LABELS: Record<FieldDef['group'], string> = {
   doc: '文档导入',
-  ocr: 'OCR 识别',
+  ocr: 'OCR 回退',
   price: '价格表（¥ / 百万 tokens，高峰=工作日 9–12 / 14–18）',
 }
 

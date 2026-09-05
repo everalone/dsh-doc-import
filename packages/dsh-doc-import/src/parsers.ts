@@ -19,6 +19,8 @@ export type DocKind = (typeof DOC_KINDS)[number]
  * are preserved by page number).
  * v3: every PDF page gets a `[第 N 页]` marker; failed OCR pages carry a
  * retryable `ocrError` instead of a permanent ocrText marker.
+ * v4: docx markdown is de-noised (embedded images → placeholders, empty
+ * bookmarks dropped); CSV stores the full table instead of a row-capped one.
  */
 export const EXTRACTOR_VERSION = 4
 
@@ -142,12 +144,16 @@ function parseCsv(bytes: Buffer, cfg: DocImportConfig): ParseResult {
   const delimiter = sniffDelimiter(lines)
   const rows = lines.map((line) => splitCsvLine(line, delimiter))
   const columns = Math.max(...rows.map((r) => r.length))
-  const capped = cfg.maxInlineTableRows ? rows.slice(0, cfg.maxInlineTableRows) : rows
-  const header = capped[0]
-  const body = capped.length > 1 ? capped.slice(1) : []
+  // Full table, always: the conversation carries only a compact reference, so
+  // nothing is gained by dropping rows here — and the read_document promise
+  // ("full text is stored") must hold for CSV too.
+  const header = rows[0]
+  const body = rows.length > 1 ? rows.slice(1) : []
   const render = (row: string[]): string => `| ${row.map(escapeTableCell).join(' | ')} |`
   const parts = [render(header), `| ${header.map(() => '---').join(' | ')} |`, ...body.map(render)]
-  if (rows.length > capped.length) warnings.push(`CSV 共 ${rows.length} 行，仅内联前 ${capped.length} 行（${columns} 列）`)
+  if (rows.length > cfg.maxInlineTableRows) {
+    warnings.push(`CSV 共 ${rows.length} 行（${columns} 列），全部内容已入库；超长表格建议用 read_document 分页读取`)
+  }
   return { kind: 'csv', text: parts.join('\n'), ocrCandidates: [], warnings }
 }
 

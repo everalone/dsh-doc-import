@@ -16,8 +16,8 @@ import { formatCny, inlineCost, ocrPageCost } from './cost.js'
 import { isLoopbackRequest, readJsonBody, writeJson } from './http.js'
 import type { DocImportConfig } from './config.js'
 import type { OcrRunner } from './ocr.js'
-import { assemblePdfText, detectKind, parseDocument, DOC_KINDS, EXTRACTOR_VERSION, KIND_LABELS } from './parsers.js'
-import { docIdFor, type DocMeta, type DocStore } from './store.js'
+import { detectKind, parseDocument, DOC_KINDS, EXTRACTOR_VERSION, KIND_LABELS, type DocKind } from './parsers.js'
+import { docIdFor, pushWarning, type DocMeta, type DocStore } from './store.js'
 
 interface AttachPayload {
   data: string
@@ -42,10 +42,9 @@ function capText(text: string, cap: number): { text: string; truncated: boolean 
 
 /** The `[document …]` header the client inlines above the text. */
 export function buildDocumentHeader(meta: DocMeta, cfg: DocImportConfig): string {
-  const parts: string[] = [meta.name, KIND_LABELS[meta.kind as keyof typeof KIND_LABELS] ?? meta.kind]
+  const parts: string[] = [meta.name, KIND_LABELS[meta.kind] ?? meta.kind]
   if (meta.pages > 0) parts.push(`${meta.pages} 页`)
   parts.push(`${meta.chars} 字符`)
-  if (meta.truncated) parts.push(`内联截断至 ${meta.inlineChars} 字符，可用 read_document 回读全文`)
   parts.push(`id: ${meta.id}`)
   const header = `[document ${parts.join(', ')}]`
   // The id is opaque. A model that misses the read_document tool description
@@ -89,7 +88,15 @@ async function handleAttach(ctx: Context, cfg: DocImportConfig, store: DocStore,
     const parsed = await parseDocument(bytes, name, mediaType, cfg)
     const id = docIdFor(bytes)
     const existing = store.registry.get(id)
+    // Same content, same kind, same extractor: serve the stored text. But
+    // never strand scanned pages — a doc imported while OCR was disabled
+    // (ocrTotal 0) or interrupted mid-job gets its OCR (re)started here.
     if (existing !== undefined && existing.kind === kind && existing.extractor === EXTRACTOR_VERSION) {
+      if (cfg.ocrEnabled && existing.ocrPages.length > 0 && (existing.ocrTotal === 0 || existing.ocrDone < existing.ocrTotal)) {
+        if (existing.ocrTotal === 0) existing.ocrTotal = existing.ocrPages.length
+        await store.writeMeta(existing)
+        ocr.start(id)
+      }
       const text = await store.readText(id)
       const capped = capText(text, cfg.inlineCap)
       writeJson(res, 200, { ok: true, doc: attachView(cfg, existing, capped.text, capped.truncated) })
@@ -103,80 +110,83 @@ async function handleAttach(ctx: Context, cfg: DocImportConfig, store: DocStore,
     if (existing !== undefined && existing.kind === kind) {
       const oldPages = await store.readPages(id)
       if (parsed.pages !== undefined && oldPages !== null) {
+        const oldByN = new Map(oldPages.map((page) => [page.n, page]))
         for (const page of parsed.pages) {
-          const old = oldPages.find((candidate) => candidate.n === page.n)
+          const old = oldByN.get(page.n)
           if (page.source === 'ocr' && old?.ocrText !== undefined && old.ocrText.length > 0 && !old.ocrText.startsWith('【')) page.ocrText = old.ocrText
         }
       }
-      const refreshed: DocMeta = {
-        ...existing,
-        name,
-        mediaType,
-        bytes: bytes.length,
-        chars: parsed.text.length,
-        inlineChars: 0,
-        truncated: false,
-        pages: parsed.pages?.length ?? 0,
-        ocrPages: parsed.ocrCandidates,
-        ocrDone: 0,
-        ocrTotal: 0,
-        ocrSkipped: 0,
-        warning: parsed.warnings.join('；'),
-        extractor: EXTRACTOR_VERSION,
-      }
-      await store.save(refreshed, bytes, parsed.text, parsed.pages)
-      if (parsed.ocrCandidates.length > 0 && cfg.ocrEnabled) {
-        refreshed.ocrTotal = parsed.ocrCandidates.length
-        await store.writeMeta(refreshed)
-        ocr.start(id)
-      } else if (parsed.ocrCandidates.length > 0) {
-        refreshed.warning = [refreshed.warning, `OCR 已禁用，${parsed.ocrCandidates.length} 个扫描页无文本内容`].filter(Boolean).join('；')
-        await store.writeMeta(refreshed)
-      }
-      const text = await store.readText(id)
-      const capped = capText(text, cfg.inlineCap)
-      writeJson(res, 200, { ok: true, doc: attachView(cfg, refreshed, capped.text, capped.truncated) })
-      return
     }
-    const meta: DocMeta = {
-      id,
-      name,
-      kind,
-      mediaType,
-      bytes: bytes.length,
-      chars: parsed.text.length,
-      inlineChars: 0,
-      truncated: false,
-      pages: parsed.pages?.length ?? 0,
-      ocrPages: parsed.ocrCandidates,
-      ocrDone: 0,
-      ocrTotal: 0,
-      ocrSkipped: 0,
-      warning: parsed.warnings.join('；'),
-      createdAt: Date.now(),
-      extractor: EXTRACTOR_VERSION,
-    }
-    await store.save(meta, bytes, parsed.text, parsed.pages)
+    const base: DocMeta = existing !== undefined && existing.kind === kind
+      ? {
+          ...existing,
+          name,
+          mediaType,
+          bytes: bytes.length,
+          chars: parsed.text.length,
+          pages: parsed.pages?.length ?? 0,
+          ocrPages: parsed.ocrCandidates,
+          ocrDone: 0,
+          ocrTotal: 0,
+          ocrSkipped: 0,
+          warning: parsed.warnings.join('；'),
+          extractor: EXTRACTOR_VERSION,
+        }
+      : {
+          id,
+          name,
+          kind,
+          mediaType,
+          bytes: bytes.length,
+          chars: parsed.text.length,
+          pages: parsed.pages?.length ?? 0,
+          ocrPages: parsed.ocrCandidates,
+          ocrDone: 0,
+          ocrTotal: 0,
+          ocrSkipped: 0,
+          warning: parsed.warnings.join('；'),
+          createdAt: Date.now(),
+          extractor: EXTRACTOR_VERSION,
+        }
+    await store.save(base, bytes, parsed.text, parsed.pages)
     if (parsed.ocrCandidates.length > 0 && cfg.ocrEnabled) {
-      meta.ocrTotal = parsed.ocrCandidates.length
-      await store.writeMeta(meta)
+      base.ocrTotal = parsed.ocrCandidates.length
+      await store.writeMeta(base)
       ocr.start(id)
     } else if (parsed.ocrCandidates.length > 0) {
-      meta.warning = [meta.warning, `OCR 已禁用，${parsed.ocrCandidates.length} 个扫描页无文本内容`].filter(Boolean).join('；')
-      await store.writeMeta(meta)
+      pushWarning(base, `OCR 已禁用，${parsed.ocrCandidates.length} 个扫描页无文本内容`)
+      await store.writeMeta(base)
     }
     const text = await store.readText(id)
     const capped = capText(text, cfg.inlineCap)
-    writeJson(res, 200, { ok: true, doc: attachView(cfg, meta, capped.text, capped.truncated) })
+    writeJson(res, 200, { ok: true, doc: attachView(cfg, base, capped.text, capped.truncated) })
   } catch (error) {
     writeJson(res, 422, { ok: false, error: { code: 'rejected', message: (error as Error).message } })
   }
 }
 
-function attachView(cfg: DocImportConfig, meta: DocMeta, text: string, truncated: boolean) {
+/** The one cost shape every route and the client agree on. */
+interface CostView {
+  tokens: number
+  cny: number
+  ocrCny: number
+  label: string
+}
+
+function costView(cfg: DocImportConfig, meta: DocMeta, text: string): CostView {
   const inline = inlineCost(text, cfg)
   const ocrCount = meta.ocrTotal > 0 ? meta.ocrTotal : meta.ocrPages.length
   const ocrCost = ocrCount > 0 ? ocrPageCost(cfg) : undefined
+  return {
+    tokens: inline.tokens,
+    cny: inline.cny,
+    ocrCny: ocrCost?.cny ?? 0,
+    label: `≈ ${inline.tokens} tokens ≈ ${formatCny(inline.cny)}${ocrCost ? `（OCR ≈ ${formatCny(ocrCost.cny)}）` : ''}`,
+  }
+}
+
+function attachView(cfg: DocImportConfig, meta: DocMeta, text: string, truncated: boolean) {
+  const ocrCount = meta.ocrTotal > 0 ? meta.ocrTotal : meta.ocrPages.length
   const ocrNeeded = meta.ocrPages.length > 0 && meta.ocrTotal > 0
   return {
     id: meta.id,
@@ -191,17 +201,7 @@ function attachView(cfg: DocImportConfig, meta: DocMeta, text: string, truncated
     text,
     truncated,
     warning: meta.warning.length > 0 ? meta.warning : undefined,
-    cost: {
-      tokens: inline.tokens,
-      cny: inline.cny,
-      cnyOffPeak: inline.cnyOffPeak,
-      cnyPeak: inline.cnyPeak,
-      isPeak: inline.isPeak,
-      ocrCny: ocrCost?.cny ?? 0,
-      ocrCnyPeak: ocrCost?.cnyPeak ?? 0,
-      ocrCnyOffPeak: ocrCost?.cnyOffPeak ?? 0,
-      label: `≈ ${inline.tokens} tokens ≈ ${formatCny(inline.cny)}${ocrCost ? `（OCR ≈ ${formatCny(ocrCost.cny)}）` : ''}`,
-    },
+    cost: costView(cfg, meta, text),
   }
 }
 
@@ -209,7 +209,7 @@ function attachView(cfg: DocImportConfig, meta: DocMeta, text: string, truncated
 export interface DocStatus {
   id: string
   name: string
-  kind: string
+  kind: DocKind
   phase: 'parsing' | 'ocr' | 'ready' | 'error'
   chars: number
   ocrDone: number
@@ -219,7 +219,7 @@ export interface DocStatus {
   warning?: string
 }
 
-async function handleStatus(store: DocStore, cfg: DocImportConfig, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleStatus(store: DocStore, cfg: DocImportConfig, ocr: OcrRunner, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://x')
   const id = url.searchParams.get('id') ?? ''
   const meta = store.registry.get(id)
@@ -228,13 +228,17 @@ async function handleStatus(store: DocStore, cfg: DocImportConfig, req: Incoming
     return
   }
   const done = meta.ocrTotal > 0 && meta.ocrDone >= meta.ocrTotal
+  // Self-healing: pending pages with no live job means a previous job was lost
+  // (host restart, killed worker). Restart it so the status always converges
+  // to a terminal phase instead of polling forever.
+  if (meta.ocrTotal > 0 && !done && !ocr.isRunning(id) && cfg.ocrEnabled) {
+    ocr.start(id)
+  }
   const phase: DocStatus['phase'] = meta.ocrTotal > 0 && !done ? (meta.ocrDone > 0 ? 'ocr' : 'parsing') : 'ready'
   if (phase === 'ready') {
     // Full text: the conversation only carries the compact reference, so the
     // preview modal and read_document both need the uncapped extraction here.
     const full = await store.readText(id)
-    const inline = inlineCost(full, cfg)
-    const ocrCost = meta.ocrPages.length > 0 ? ocrPageCost(cfg) : undefined
     writeJson(res, 200, {
       ok: true,
       doc: {
@@ -248,12 +252,7 @@ async function handleStatus(store: DocStore, cfg: DocImportConfig, req: Incoming
         text: full,
         truncated: false,
         warning: meta.warning.length > 0 ? meta.warning : undefined,
-        cost: {
-          tokens: inline.tokens,
-          cny: inline.cny,
-          ocrCny: ocrCost?.cny ?? 0,
-          label: `≈ ${inline.tokens} tokens ≈ ${formatCny(inline.cny)}${ocrCost ? `（OCR ≈ ${formatCny(ocrCost.cny)}）` : ''}`,
-        },
+        cost: costView(cfg, meta, full),
       },
     })
     return
@@ -329,7 +328,7 @@ export function registerDocRoutes(ctx: Context, getCfg: () => DocImportConfig, s
         return
       }
       if (pathname === '/doc-import/status' && req.method === 'GET') {
-        await handleStatus(store, getCfg(), req, res)
+        await handleStatus(store, getCfg(), ocr, req, res)
         return
       }
       if (pathname.startsWith('/doc-import/raw/') && req.method === 'GET') {
@@ -340,5 +339,3 @@ export function registerDocRoutes(ctx: Context, getCfg: () => DocImportConfig, s
     },
   })
 }
-
-export { assemblePdfText }

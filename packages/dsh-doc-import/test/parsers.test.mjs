@@ -5,6 +5,8 @@ import { estimateTokens, inlineCost, isPeakBeijing } from '../lib/cost.js'
 import { resolveConfig } from '../lib/config.js'
 import { joinTextItems } from '../lib/pdf.js'
 import { readDocumentTool } from '../lib/tool.js'
+import { buildDocumentHeader } from '../lib/routes.js'
+import { pushWarning } from '../lib/store.js'
 
 const cfg = resolveConfig()
 
@@ -192,4 +194,34 @@ test('read_document returns empty text past the end', async () => {
 test('read_document rejects unknown doc ids', async () => {
   const tool = readDocumentTool(fakeStore('x'))
   await assert.rejects(() => tool.execute({ docId: 'ghost' }))
+})
+
+test('csv parser stores the full table regardless of the row cap', async () => {
+  const small = resolveConfig({ maxInlineTableRows: 3 })
+  const csv = ['名称,数量', '苹果,3', '香蕉,5', '樱桃,7', '枣,9'].join('\n')
+  const result = await parseDocument(Buffer.from(csv), 'a.csv', 'text/csv', small)
+  for (const name of ['苹果', '香蕉', '樱桃', '枣']) {
+    assert.ok(result.text.includes(name), `row ${name} must stay in the stored text`)
+  }
+  assert.ok(result.warnings.some((w) => w.includes('read_document')))
+})
+
+test('buildDocumentHeader carries the read guidance and never the dead inline clause', () => {
+  const meta = {
+    id: 'a'.repeat(64), name: 'doc.pdf', kind: 'pdf', mediaType: 'application/pdf',
+    bytes: 10, chars: 120, pages: 2, ocrPages: [], ocrDone: 0, ocrTotal: 0,
+    ocrSkipped: 0, warning: '', createdAt: 0, extractor: EXTRACTOR_VERSION,
+  }
+  const header = buildDocumentHeader(meta, cfg)
+  assert.ok(header.includes('id: ' + 'a'.repeat(64)))
+  assert.ok(header.includes('read_document'))
+  assert.ok(!header.includes('内联截断'))
+})
+
+test('pushWarning joins messages with the canonical separator', () => {
+  const meta = { warning: '' }
+  pushWarning(meta, '第一条')
+  pushWarning(meta, '第二条')
+  pushWarning(meta, '')
+  assert.equal(meta.warning, '第一条；第二条')
 })

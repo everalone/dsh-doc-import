@@ -12,7 +12,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { assemblePdfText } from './parsers.js'
 import { renderPagePng } from './pdf.js'
 import type { DocImportConfig } from './config.js'
-import type { DocStore, DocMeta, PdfPageRecord } from './store.js'
+import { pushWarning, type DocStore, type DocMeta, type PdfPageRecord } from './store.js'
 
 const OCR_PROMPT =
   '逐字转录这张扫描页的全部文字，保留原有换行与段落结构，按阅读顺序输出。'
@@ -31,11 +31,12 @@ interface VisionResponse {
 async function requestTranscription(cfg: DocImportConfig, apiKey: string, png: Buffer, signal: AbortSignal, maxTokens: number): Promise<{ text: string; finishReason: string }> {
   const base = cfg.ocrBaseURL.replace(/\/+$/, '')
   const endpoint = `${base}/chat/completions`
-  const body = JSON.stringify({
+  // `thinking` is a DeepSeek extension: sending it to a generic OpenAI-compatible
+  // endpoint can 400. Only include it when the target looks like DeepSeek.
+  const deepseek = /deepseek/i.test(cfg.ocrBaseURL) || /deepseek/i.test(cfg.ocrModel)
+  const payloadBody: Record<string, unknown> = {
     model: cfg.ocrModel,
     max_tokens: maxTokens,
-    // Transcription needs no chain-of-thought: cut latency and output cost.
-    thinking: { type: 'disabled' },
     messages: [
       {
         role: 'user',
@@ -45,7 +46,9 @@ async function requestTranscription(cfg: DocImportConfig, apiKey: string, png: B
         ],
       },
     ],
-  })
+  }
+  if (deepseek) payloadBody.thinking = { type: 'disabled' }
+  const body = JSON.stringify(payloadBody)
   const response = await fetch(endpoint, {
     method: 'POST',
     signal,
@@ -97,6 +100,8 @@ async function resolveApiKey(ctx: Context, cfg: DocImportConfig): Promise<string
 export interface OcrRunner {
   /** Start the OCR job for a document; no-op when it already ran or is running. */
   start(docId: string): void
+  /** Whether a background OCR job is currently running for the document. */
+  isRunning(docId: string): boolean
 }
 
 export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => DocImportConfig): OcrRunner {
@@ -108,6 +113,7 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
     const cfg = getCfg()
     const pages = await store.readPages(docId)
     if (pages === null) return
+    const byN = new Map(pages.map((page) => [page.n, page]))
     // Failed pages (ocrText empty, ocrError set) come back into the todo list,
     // so re-triggering OCR retries them.
     const todo = pages.filter((p) => p.source === 'ocr' && (p.ocrText ?? '').length === 0).map((p) => p.n)
@@ -117,13 +123,13 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
       await store.writeMeta(meta)
       return
     }
-    let capped = todo
-    if (todo.length > cfg.ocrPageCap) {
-      capped = todo.slice(0, cfg.ocrPageCap)
-      meta.ocrSkipped = todo.length - cfg.ocrPageCap
-      meta.warning = [meta.warning, `OCR 页数超过 ${cfg.ocrPageCap} 页上限，跳过 ${meta.ocrSkipped} 页`].filter(Boolean).join('；')
-      for (const n of todo.slice(cfg.ocrPageCap)) {
-        const page = pages.find((p) => p.n === n)
+    // Page cap 0 means "unlimited" (as the settings card promises).
+    const capped = cfg.ocrPageCap > 0 && todo.length > cfg.ocrPageCap ? todo.slice(0, cfg.ocrPageCap) : todo
+    if (capped.length < todo.length) {
+      meta.ocrSkipped = todo.length - capped.length
+      pushWarning(meta, `OCR 页数超过 ${cfg.ocrPageCap} 页上限，跳过 ${meta.ocrSkipped} 页`)
+      for (const n of todo.slice(capped.length)) {
+        const page = byN.get(n)
         if (page !== undefined) page.ocrText = `【第 ${n} 页 · OCR 超出页数上限已跳过】`
       }
     }
@@ -132,80 +138,92 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
     await store.writeMeta(meta)
     if (capped.length === 0) return
 
-    let apiKey: string
     try {
-      apiKey = await resolveApiKey(ctx, cfg)
+      let apiKey: string
+      try {
+        apiKey = await resolveApiKey(ctx, cfg)
+      } catch (error) {
+        pushWarning(meta, `OCR 未执行：${(error as Error).message}`)
+        for (const n of capped) {
+          const page = byN.get(n)
+          if (page !== undefined) page.ocrError = '未配置 API Key'
+        }
+        meta.ocrDone = meta.ocrTotal
+        await store.writePages(docId, pages)
+        await store.writeText(docId, assemblePdfText(pages, (n) => `【第 ${n} 页 · 扫描页文本待 OCR】`), meta)
+        return
+      }
+
+      let cursor = 0
+      const worker = async (): Promise<void> => {
+        while (cursor < capped.length) {
+          const index = cursor
+          cursor += 1
+          const n = capped[index]
+          const page = byN.get(n)
+          if (page === undefined) {
+            meta.ocrDone += 1
+            continue
+          }
+          let lastError: unknown
+          let done = false
+          for (let attempt = 0; attempt < 2 && !done; attempt += 1) {
+            const controller = new AbortController()
+            const timer = setTimeout(() => controller.abort(new Error('OCR 请求超时')), cfg.ocrTimeoutMs)
+            try {
+              const original = await store.readOriginal(docId)
+              const png = await renderPagePng(original, n, cfg.ocrImageScale)
+              const result = await transcribePage(cfg, apiKey, png, controller.signal)
+              page.ocrText = result.text.length === 0 ? '（空白页）' : result.text
+              if (result.truncated) {
+                page.ocrText += '\n\n【OCR 输出达到 token 上限，可能截断】'
+                pushWarning(meta, `第 ${n} 页 OCR 输出达到 token 上限，可能截断`)
+              }
+              page.ocrError = undefined
+              done = true
+            } catch (error) {
+              lastError = error
+            } finally {
+              clearTimeout(timer)
+            }
+          }
+          if (!done) {
+            // Retryable failure: keep ocrText empty + record ocrError so the
+            // page re-enters the todo list on the next OCR trigger.
+            page.ocrError = String((lastError as Error)?.message ?? lastError).slice(0, 200)
+          }
+          meta.ocrDone += 1
+          const updated = { ...meta }
+          updated.chars = pages.reduce((sum, p) => sum + ((p.ocrText ?? p.text).length), 0)
+          await store.writePages(docId, pages)
+          await store.writeText(docId, assemblePdfText(pages, (p) => `【第 ${p} 页 · 扫描页文本待 OCR】`), updated)
+        }
+      }
+
+      const workers = Array.from({ length: Math.min(cfg.ocrConcurrency, capped.length) }, () => worker())
+      await Promise.all(workers)
+      const finalMeta = { ...store.registry.get(docId) ?? meta }
+      finalMeta.ocrDone = finalMeta.ocrTotal
+      finalMeta.chars = pages.reduce((sum, p) => sum + ((p.ocrText ?? p.text).length), 0)
+      const failedCount = capped.filter((n) => byN.get(n)?.ocrError !== undefined).length
+      if (failedCount > 0) {
+        pushWarning(finalMeta, `OCR 失败 ${failedCount} 页，重新发送 OCR 请求可重试失败页`)
+      }
+      await store.writeMeta(finalMeta)
     } catch (error) {
-      meta.warning = [meta.warning, `OCR 未执行：${(error as Error).message}`].filter(Boolean).join('；')
+      // Fatal job error (storage failure, unexpected throw): settle the meta so
+      // the status route reaches a terminal state instead of hanging clients —
+      // failed pages stay retryable through the next /doc-import/ocr POST.
+      const message = ((error as Error)?.message ?? String(error)).slice(0, 200)
       for (const n of capped) {
-        const page = pages.find((p) => p.n === n)
-        if (page !== undefined) page.ocrError = '未配置 API Key'
+        const page = byN.get(n)
+        if (page !== undefined && (page.ocrText ?? '').length === 0) page.ocrError = message
       }
       meta.ocrDone = meta.ocrTotal
-      await store.writePages(docId, pages)
-      await store.writeText(docId, assemblePdfText(pages, (n) => `【第 ${n} 页 · 扫描页文本待 OCR】`), meta)
-      return
+      pushWarning(meta, `OCR 中断：${message}`)
+      await store.writePages(docId, pages).catch(() => {})
+      await store.writeText(docId, assemblePdfText(pages, (n) => `【第 ${n} 页 · 扫描页文本待 OCR】`), meta).catch(() => {})
     }
-
-    let cursor = 0
-    const worker = async (): Promise<void> => {
-      while (cursor < capped.length) {
-        const index = cursor
-        cursor += 1
-        const n = capped[index]
-        const page = pages.find((p) => p.n === n)
-        if (page === undefined) {
-          meta.ocrDone += 1
-          continue
-        }
-        let lastError: unknown
-        let done = false
-        for (let attempt = 0; attempt < 2 && !done; attempt += 1) {
-          const controller = new AbortController()
-          const timer = setTimeout(() => controller.abort(new Error('OCR 请求超时')), cfg.ocrTimeoutMs)
-          try {
-            const original = await store.readOriginal(docId)
-            const png = await renderPagePng(original, n, cfg.ocrImageScale)
-            const result = await transcribePage(cfg, apiKey, png, controller.signal)
-            page.ocrText = result.text.length === 0 ? '（空白页）' : result.text
-            if (result.truncated) {
-              page.ocrText += '\n\n【OCR 输出达到 token 上限，可能截断】'
-              meta.warning = [meta.warning, `第 ${n} 页 OCR 输出达到 token 上限，可能截断`].filter(Boolean).join('；')
-            }
-            page.ocrError = undefined
-            done = true
-          } catch (error) {
-            lastError = error
-          } finally {
-            clearTimeout(timer)
-          }
-        }
-        if (!done) {
-          // Retryable failure: keep ocrText empty + record ocrError so the
-          // page re-enters the todo list on the next OCR trigger.
-          page.ocrError = String((lastError as Error)?.message ?? lastError).slice(0, 200)
-        }
-        meta.ocrDone += 1
-        const updated = { ...meta }
-        updated.chars = pages.reduce((sum, p) => sum + ((p.ocrText ?? p.text).length), 0)
-        await store.writePages(docId, pages)
-        await store.writeText(docId, assemblePdfText(pages, (p) => `【第 ${p} 页 · 扫描页文本待 OCR】`), updated)
-      }
-    }
-
-    const workers = Array.from({ length: Math.min(cfg.ocrConcurrency, capped.length) }, () => worker())
-    await Promise.all(workers)
-    const finalMeta = { ...store.registry.get(docId) ?? meta }
-    finalMeta.ocrDone = finalMeta.ocrTotal
-    finalMeta.chars = pages.reduce((sum, p) => sum + ((p.ocrText ?? p.text).length), 0)
-    const failedCount = capped.filter((n) => {
-      const page = pages.find((p) => p.n === n)
-      return page !== undefined && page.ocrError !== undefined
-    }).length
-    if (failedCount > 0) {
-      finalMeta.warning = [finalMeta.warning, `OCR 失败 ${failedCount} 页，重新发送 OCR 请求可重试失败页`].filter(Boolean).join('；')
-    }
-    await store.writeMeta(finalMeta)
   }
 
   return {
@@ -215,7 +233,7 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
         .catch((error) => {
           const meta = store.registry.get(docId)
           if (meta !== undefined) {
-            meta.warning = [meta.warning, `OCR 失败：${(error as Error)?.message ?? String(error)}`].filter(Boolean).join('；')
+            pushWarning(meta, `OCR 失败：${(error as Error)?.message ?? String(error)}`)
             void store.writeMeta(meta).catch(() => {})
           }
         })
@@ -224,8 +242,8 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
         })
       running.set(docId, job)
     },
+    isRunning(docId) {
+      return running.has(docId)
+    },
   }
 }
-
-export { assemblePdfText }
-export type { PdfPageRecord, DocMeta }

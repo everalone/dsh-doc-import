@@ -111,6 +111,9 @@ async function postJson<T>(url: string, payload?: unknown): Promise<T> {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
+/** Overall poll budget: beyond this a job is declared stuck and surfaces as an error. */
+const POLL_DEADLINE_MS = 15 * 60_000
+
 interface AttachResponse {
   ok: true
   doc: {
@@ -171,6 +174,7 @@ function createDraft(name: string, kind: string, bytes: number): DraftDoc {
 }
 
 async function pollUntilReady(doc: DraftDoc): Promise<void> {
+  const deadline = Date.now() + POLL_DEADLINE_MS
   try {
     for (;;) {
       await sleep(700)
@@ -195,6 +199,15 @@ async function pollUntilReady(doc: DraftDoc): Promise<void> {
       if (status.phase === 'error') {
         doc.status = 'error'
         doc.error = status.warning ?? 'OCR 失败'
+        doc.resolveReady()
+        emit()
+        return
+      }
+      // The host settles every job (self-healing status route), so this is a
+      // last-resort guard: never leave a send waiting forever.
+      if (Date.now() > deadline) {
+        doc.status = 'error'
+        doc.error = 'OCR 处理超时，已停止等待（文档仍在后台，可稍后在预览中查看）'
         doc.resolveReady()
         emit()
         return
@@ -240,7 +253,11 @@ export async function importFiles(files: readonly File[]): Promise<void> {
       if (d.ocrNeeded) {
         doc.status = 'ocr'
         emit()
-        await postJson('/doc-import/ocr', { id: doc.id }).catch(() => {})
+        // A failed kick-off is not fatal: the status route self-heals by
+        // restarting stalled jobs, so keep polling regardless.
+        await postJson('/doc-import/ocr', { id: doc.id }).catch((error: unknown) => {
+          console.warn('[doc-import] OCR kick-off failed; relying on status self-heal:', error)
+        })
         void pollUntilReady(doc)
       } else {
         doc.status = 'ready'

@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
+import type { DocKind } from './parsers.js'
 
 export interface PdfPageRecord {
   n: number
@@ -23,12 +24,10 @@ export interface PdfPageRecord {
 export interface DocMeta {
   id: string
   name: string
-  kind: string
+  kind: DocKind
   mediaType: string
   bytes: number
   chars: number
-  inlineChars: number
-  truncated: boolean
   pages: number
   /** 1-based page numbers of scanned pages (OCR candidates). */
   ocrPages: number[]
@@ -39,6 +38,11 @@ export interface DocMeta {
   createdAt: number
   /** Extraction pipeline version that produced the stored text. */
   extractor: number
+}
+
+/** Append one message to the meta warning chain ('；'-joined). */
+export function pushWarning(meta: DocMeta, message: string): void {
+  meta.warning = [meta.warning, message].filter(Boolean).join('；')
 }
 
 export function docIdFor(bytes: Buffer): string {
