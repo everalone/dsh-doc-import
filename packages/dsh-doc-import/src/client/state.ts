@@ -6,11 +6,17 @@
  * @module dsh-doc-import/client/state
  */
 
+import type { CostView } from '../cost.js'
+import { FALLBACK_POLL_BUDGET_MS, POLL_INTERVAL_MS } from './timing.js'
+
 export type DraftStatus = 'uploading' | 'parsing' | 'ocr' | 'ready' | 'error'
 
 export interface DraftDoc {
   id: string
   name: string
+  // Deliberately `string`, not the host's DocKind union: the draft is created
+  // from the file extension before the host responds, and unknown extensions
+  // must not crash the client — the host remains the parser of record.
   kind: string
   bytes: number
   chars: number
@@ -111,9 +117,6 @@ async function postJson<T>(url: string, payload?: unknown): Promise<T> {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
-/** Overall poll budget: beyond this a job is declared stuck and surfaces as an error. */
-const POLL_DEADLINE_MS = 15 * 60_000
-
 interface AttachResponse {
   ok: true
   doc: {
@@ -129,7 +132,7 @@ interface AttachResponse {
     text: string
     truncated: boolean
     warning?: string
-    cost: { tokens: number; cny: number; ocrCny: number; label: string }
+    cost: CostView
   }
 }
 
@@ -146,7 +149,8 @@ interface StatusResponse {
     text?: string
     truncated?: boolean
     warning?: string
-    cost?: { tokens: number; cny: number; ocrCny: number; label: string }
+    cost?: CostView
+    ocrBudgetMs?: number
   }
 }
 
@@ -174,12 +178,17 @@ function createDraft(name: string, kind: string, bytes: number): DraftDoc {
 }
 
 async function pollUntilReady(doc: DraftDoc): Promise<void> {
-  const deadline = Date.now() + POLL_DEADLINE_MS
+  // The host advertises a poll budget sized to the real job (pages × attempts
+  // × timeout ÷ concurrency); a healthy large OCR run can legitimately take
+  // hours, so a fixed deadline would fail sound jobs — and the host keeps
+  // paying while the client has already given up.
+  let deadline: number | null = null
   try {
     for (;;) {
-      await sleep(700)
+      await sleep(POLL_INTERVAL_MS)
       const response = await postJson<StatusResponse>(`/doc-import/status?id=${encodeURIComponent(doc.id)}`)
       const status = response.doc
+      deadline ??= Date.now() + (status.ocrBudgetMs ?? FALLBACK_POLL_BUDGET_MS)
       doc.ocrDone = status.ocrDone
       doc.ocrTotal = status.ocrTotal
       doc.warning = status.warning

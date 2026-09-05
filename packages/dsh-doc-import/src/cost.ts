@@ -70,3 +70,15 @@ export function formatCny(cny: number): string {
   if (cny < 0.01) return `¥${cny.toFixed(4)}`
   return `¥${cny.toFixed(2)}`
 }
+
+/**
+ * The one cost shape every route response and the client agree on — defined
+ * here (dependency-free) so host routes and the browser half share the type
+ * instead of hand-writing it per file.
+ */
+export interface CostView {
+  tokens: number
+  cny: number
+  ocrCny: number
+  label: string
+}

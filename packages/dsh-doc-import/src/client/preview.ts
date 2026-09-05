@@ -18,6 +18,7 @@
  */
 
 import { dictionaries, getDocImportLanguage, type DocImportClientKey } from './locales.js'
+import { PREVIEW_POLL_BUDGET_MS, PREVIEW_POLL_INTERVAL_MS } from './timing.js'
 
 /** Matches one `[document … id: <sha256>]` reference inside message text. */
 const REFERENCE_PATTERN = /\[document ([^\]\n]+?), id: ([0-9a-f]{64})\]/g
@@ -178,9 +179,11 @@ function openModal(docId: string, title: string): void {
   interface StatusDoc {
     kind: string
     chars: number
+    phase?: 'parsing' | 'ocr' | 'ready' | 'error'
     text?: string
     cost?: { label: string }
     warning?: string
+    ocrBudgetMs?: number
   }
 
   const load = async (): Promise<StatusDoc> => {
@@ -216,6 +219,10 @@ function openModal(docId: string, title: string): void {
 
   /** Poll while OCR is pending so a mid-job open converges instead of sticking on "加载中…". */
   const pollUntilText = async (): Promise<void> => {
+    // Budgeted: prefer the host-advertised `ocrBudgetMs` (shared math with the
+    // OCR runner), fall back to a fixed bound — an unbounded poll loop against
+    // a lost job would spin forever.
+    let deadline: number | null = null
     for (;;) {
       let doc: StatusDoc
       try {
@@ -230,9 +237,17 @@ function openModal(docId: string, title: string): void {
       }
       // Modal closed while polling: stop.
       if (document.querySelector(`[${MODAL_ATTR}]`) === null) return
+      deadline ??= Date.now() + (doc.ocrBudgetMs ?? PREVIEW_POLL_BUDGET_MS)
       render(doc)
       if (doc.text !== undefined) return
-      await new Promise((resolve) => setTimeout(resolve, 2_000))
+      if (doc.phase === 'error' || Date.now() > deadline) {
+        const failed = document.createElement('div')
+        failed.textContent = t('file.failed', { error: doc.warning ?? 'OCR 未能完成' })
+        failed.style.cssText = 'color:var(--dsh-alias-label-danger, #e5484d);font-size:13px;'
+        body.append(failed)
+        return
+      }
+      await new Promise((resolve) => setTimeout(resolve, PREVIEW_POLL_INTERVAL_MS))
     }
   }
 

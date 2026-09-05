@@ -34,6 +34,8 @@ export interface DocMeta {
   ocrDone: number
   ocrTotal: number
   ocrSkipped: number
+  /** Terminal OCR job failure (e.g. self-heal budget exhausted); empty when the job can still converge. */
+  ocrFatal?: string
   warning: string
   createdAt: number
   /** Extraction pipeline version that produced the stored text. */
@@ -43,6 +45,16 @@ export interface DocMeta {
 /** Append one message to the meta warning chain ('；'-joined). */
 export function pushWarning(meta: DocMeta, message: string): void {
   meta.warning = [meta.warning, message].filter(Boolean).join('；')
+}
+
+/** Index pages by 1-based page number (shared by the OCR runner and re-import path). */
+export function pagesByNumber(pages: PdfPageRecord[]): Map<number, PdfPageRecord> {
+  return new Map(pages.map((page) => [page.n, page]))
+}
+
+/** The OCR page count to show/charge for: the settled total, or the candidate list while unsettled. */
+export function ocrPageCount(meta: DocMeta): number {
+  return meta.ocrTotal > 0 ? meta.ocrTotal : meta.ocrPages.length
 }
 
 export function docIdFor(bytes: Buffer): string {
@@ -99,13 +111,15 @@ export function createDocStore(): DocStore {
       registry.set(meta.id, meta)
     },
     async writeMeta(meta) {
-      await writeFile(join(docDir(meta.id), 'meta.json'), JSON.stringify(meta), 'utf8')
+      // Registry first: when the disk write fails (the failure mode that used
+      // to amplify into restart loops) the in-memory state still converges.
       registry.set(meta.id, meta)
+      await writeFile(join(docDir(meta.id), 'meta.json'), JSON.stringify(meta), 'utf8')
     },
     async writeText(id, text, meta) {
+      registry.set(id, meta)
       await writeFile(join(docDir(id), 'text.txt'), text, 'utf8')
       await writeFile(join(docDir(id), 'meta.json'), JSON.stringify(meta), 'utf8')
-      registry.set(meta.id, meta)
     },
     async writePages(id, pages) {
       await writeFile(join(docDir(id), 'pages.json'), JSON.stringify(pages), 'utf8')

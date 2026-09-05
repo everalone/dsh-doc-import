@@ -15,11 +15,9 @@
  */
 
 import { clearReadyDrafts, getDrafts } from './state.js'
+import { SEND_WAIT_MS } from './timing.js'
 
 const HOOK_MARKER = '__dshDocImportSendHooked'
-
-/** Upper bound for waiting on pending OCR before the send proceeds anyway. */
-const READY_WAIT_MS = 120_000
 
 interface ConversationSendFace {
   sendSession(session: unknown, text: string, imageIds: readonly string[], mode: string, signal?: AbortSignal): Promise<unknown>
@@ -46,10 +44,14 @@ export function installSendHook(
       // read_document the full text once OCR finishes).
       await Promise.race([
         Promise.all(candidates.map((doc) => doc.ready)),
-        new Promise<void>((resolve) => setTimeout(resolve, READY_WAIT_MS)),
+        new Promise<void>((resolve) => setTimeout(resolve, SEND_WAIT_MS)),
       ])
     } catch {
       // Individual docs already settled into the error state.
+    }
+    const unsettled = candidates.filter((doc) => doc.status !== 'ready' && doc.status !== 'error').length
+    if (unsettled > 0) {
+      console.warn(`[doc-import] ${unsettled} document(s) still pending after ${SEND_WAIT_MS / 1000}s; sending without their references`)
     }
     const ready = candidates.filter((doc) => doc.status === 'ready' && doc.header.length > 0)
     if (ready.length === 0) {

@@ -12,11 +12,14 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { assemblePdfText } from './parsers.js'
 import { renderPagePng } from './pdf.js'
 import type { DocImportConfig } from './config.js'
-import { pushWarning, type DocStore, type DocMeta, type PdfPageRecord } from './store.js'
+import { pushWarning, pagesByNumber, type DocStore, type DocMeta, type PdfPageRecord } from './store.js'
 
 const OCR_PROMPT =
   '逐字转录这张扫描页的全部文字，保留原有换行与段落结构，按阅读顺序输出。'
   + '若页面上没有任何文字，只回复 [EMPTY]。只输出页面文字本身，不要任何解释、标题或补充。'
+
+/** Placeholder shown for scanned pages whose OCR text is not (yet) available. */
+const pendingLabel = (n: number): string => `【第 ${n} 页 · 扫描页文本待 OCR】`
 
 interface VisionChoice {
   message?: { content?: string }
@@ -97,11 +100,56 @@ async function resolveApiKey(ctx: Context, cfg: DocImportConfig): Promise<string
   throw new Error('doc-import OCR：未配置 API Key（设置 ocrApiKey 或在凭证服务中存储 ocrApiKeyEnv）')
 }
 
+/**
+ * Upper bound for how long one OCR job can legitimately take: every page may
+ * spend two attempts, each up to the per-page timeout, spread across the
+ * configured concurrency — with a 1.5× scheduling margin plus a one-minute
+ * grace. The status route publishes this so clients derive their poll budget
+ * from the same math instead of hardcoding a deadline that healthy large jobs
+ * blow through (100 pages ≈ 2.2 h worst case, far beyond a fixed 15 min).
+ */
+export function estimateOcrBudgetMs(cfg: DocImportConfig, pageCount: number): number {
+  const perRun = pageCount * 2 * cfg.ocrTimeoutMs / Math.max(cfg.ocrConcurrency, 1) * 1.5 + 60_000
+  return Math.min(Math.max(perRun, 60_000), 6 * 3_600_000)
+}
+
 export interface OcrRunner {
-  /** Start the OCR job for a document; no-op when it already ran or is running. */
-  start(docId: string): void
-  /** Whether a background OCR job is currently running for the document. */
-  isRunning(docId: string): boolean
+  /**
+   * Start the OCR job for a document. Returns the job promise when a new job
+   * was started, or undefined when one is already running (start is
+   * idempotent — callers never need a separate isRunning probe).
+   */
+  start(docId: string): Promise<void> | undefined
+}
+
+/**
+ * Shared terminal finalize for early-exit paths (no API key, fatal job error):
+ * mark every still-empty page as failed, settle the progress counters so the
+ * status route reaches a terminal state, and persist. A failed text/pages
+ * write falls back to a meta-only write — the counters must land somewhere,
+ * otherwise a stuck `ocrDone < ocrTotal` combines with the status route's
+ * self-heal into a restart loop.
+ */
+async function finalizeOcr(
+  store: DocStore,
+  docId: string,
+  pages: PdfPageRecord[],
+  meta: DocMeta,
+  note: string,
+  markFailed: (page: PdfPageRecord) => void,
+): Promise<void> {
+  for (const page of pages) {
+    if (page.source === 'ocr' && (page.ocrText ?? '').length === 0) markFailed(page)
+  }
+  meta.ocrDone = meta.ocrTotal
+  pushWarning(meta, note)
+  meta.chars = pages.reduce((sum, p) => sum + ((p.ocrText ?? p.text).length), 0)
+  try {
+    await store.writePages(docId, pages)
+    await store.writeText(docId, assemblePdfText(pages, pendingLabel), meta)
+  } catch {
+    await store.writeMeta(meta).catch(() => {})
+  }
 }
 
 export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => DocImportConfig): OcrRunner {
@@ -143,14 +191,9 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
       try {
         apiKey = await resolveApiKey(ctx, cfg)
       } catch (error) {
-        pushWarning(meta, `OCR 未执行：${(error as Error).message}`)
-        for (const n of capped) {
-          const page = byN.get(n)
-          if (page !== undefined) page.ocrError = '未配置 API Key'
-        }
-        meta.ocrDone = meta.ocrTotal
-        await store.writePages(docId, pages)
-        await store.writeText(docId, assemblePdfText(pages, (n) => `【第 ${n} 页 · 扫描页文本待 OCR】`), meta)
+        await finalizeOcr(store, docId, pages, meta, `OCR 未执行：${(error as Error).message}`, (page) => {
+          page.ocrError = '未配置 API Key'
+        })
         return
       }
 
@@ -196,7 +239,7 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
           const updated = { ...meta }
           updated.chars = pages.reduce((sum, p) => sum + ((p.ocrText ?? p.text).length), 0)
           await store.writePages(docId, pages)
-          await store.writeText(docId, assemblePdfText(pages, (p) => `【第 ${p} 页 · 扫描页文本待 OCR】`), updated)
+          await store.writeText(docId, assemblePdfText(pages, pendingLabel), updated)
         }
       }
 
@@ -215,20 +258,15 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
       // the status route reaches a terminal state instead of hanging clients —
       // failed pages stay retryable through the next /doc-import/ocr POST.
       const message = ((error as Error)?.message ?? String(error)).slice(0, 200)
-      for (const n of capped) {
-        const page = byN.get(n)
-        if (page !== undefined && (page.ocrText ?? '').length === 0) page.ocrError = message
-      }
-      meta.ocrDone = meta.ocrTotal
-      pushWarning(meta, `OCR 中断：${message}`)
-      await store.writePages(docId, pages).catch(() => {})
-      await store.writeText(docId, assemblePdfText(pages, (n) => `【第 ${n} 页 · 扫描页文本待 OCR】`), meta).catch(() => {})
+      await finalizeOcr(store, docId, pages, meta, `OCR 中断：${message}`, (page) => {
+        page.ocrError = message
+      })
     }
   }
 
   return {
     start(docId) {
-      if (running.has(docId)) return
+      if (running.has(docId)) return undefined
       const job = run(docId)
         .catch((error) => {
           const meta = store.registry.get(docId)
@@ -241,9 +279,7 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
           running.delete(docId)
         })
       running.set(docId, job)
-    },
-    isRunning(docId) {
-      return running.has(docId)
+      return job
     },
   }
 }

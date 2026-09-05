@@ -12,12 +12,12 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { formatCny, inlineCost, ocrPageCost } from './cost.js'
+import { formatCny, inlineCost, ocrPageCost, type CostView } from './cost.js'
 import { isLoopbackRequest, readJsonBody, writeJson } from './http.js'
 import type { DocImportConfig } from './config.js'
-import type { OcrRunner } from './ocr.js'
+import { estimateOcrBudgetMs, type OcrRunner } from './ocr.js'
 import { detectKind, parseDocument, DOC_KINDS, EXTRACTOR_VERSION, KIND_LABELS, type DocKind } from './parsers.js'
-import { docIdFor, pushWarning, type DocMeta, type DocStore } from './store.js'
+import { docIdFor, pushWarning, pagesByNumber, ocrPageCount, type DocMeta, type DocStore } from './store.js'
 
 interface AttachPayload {
   data: string
@@ -38,6 +38,60 @@ function decodeBase64(data: string): Buffer | undefined {
 function capText(text: string, cap: number): { text: string; truncated: boolean } {
   if (text.length <= cap) return { text, truncated: false }
   return { text: text.slice(0, cap) + '\n\n…（已截断）', truncated: true }
+}
+
+// --- OCR (re)start policy ---------------------------------------------------
+
+/** Self-heal attempts before a repeatedly dying job is declared fatal. */
+const SELF_HEAL_MAX_ATTEMPTS = 3
+const SELF_HEAL_BACKOFF_MS = 30_000
+
+/**
+ * Per-doc self-heal bookkeeping. In-memory by design: a host restart is
+ * itself the kind of job loss the self-heal exists to recover from.
+ */
+const selfHeal = new Map<string, { attempts: number; lastAt: number }>()
+
+/** Explicit (re)start from attach or the manual OCR route: clear the fatal marker and retry budget, then kick off. */
+function startOcr(ocr: OcrRunner, store: DocStore, id: string): void {
+  const meta = store.registry.get(id)
+  if (meta !== undefined) {
+    delete meta.ocrFatal
+    selfHeal.delete(id)
+  }
+  const job = ocr.start(id)
+  // A completed job restores the retry budget for the next stall.
+  if (job !== undefined) void job.then(() => { selfHeal.delete(id) })
+}
+
+/**
+ * Self-healing restart for stalled jobs, with a capped, backed-off retry
+ * budget. Unguarded, every status poll (700 ms client / 2 s preview) of a
+ * job that keeps dying launched a fresh paid OCR run — the hang the
+ * self-heal was meant to remove, resurrected as an infinite billing loop.
+ * Past the budget the doc settles into the terminal `error` phase; an
+ * explicit re-import or manual OCR call resets the budget.
+ */
+async function ensureOcrStarted(store: DocStore, cfg: DocImportConfig, ocr: OcrRunner, id: string): Promise<void> {
+  const meta = store.registry.get(id)
+  if (meta === undefined || !cfg.ocrEnabled || meta.ocrFatal !== undefined) return
+  if (meta.ocrTotal === 0 || meta.ocrDone >= meta.ocrTotal) return
+  const state = selfHeal.get(id) ?? { attempts: 0, lastAt: 0 }
+  if (state.attempts >= SELF_HEAL_MAX_ATTEMPTS) {
+    const message = `OCR 作业连续 ${state.attempts} 次未能完成（可能是存储写入失败），已停止自动重启；重新发送该文档或手动重试可恢复`
+    meta.ocrFatal = message
+    pushWarning(meta, message)
+    await store.writeMeta(meta).catch(() => {})
+    return
+  }
+  const backoff = state.attempts === 0 ? 0 : Math.min(SELF_HEAL_BACKOFF_MS * 2 ** (state.attempts - 1), 300_000)
+  if (Date.now() - state.lastAt < backoff) return
+  const job = ocr.start(id)
+  if (job === undefined) return // a live job is already working; nothing to heal
+  state.attempts += 1
+  state.lastAt = Date.now()
+  selfHeal.set(id, state)
+  void job.then(() => { selfHeal.delete(id) })
 }
 
 /** The `[document …]` header the client inlines above the text. */
@@ -89,13 +143,19 @@ async function handleAttach(ctx: Context, cfg: DocImportConfig, store: DocStore,
     const id = docIdFor(bytes)
     const existing = store.registry.get(id)
     // Same content, same kind, same extractor: serve the stored text. But
-    // never strand scanned pages — a doc imported while OCR was disabled
-    // (ocrTotal 0) or interrupted mid-job gets its OCR (re)started here.
+    // never strand scanned pages — a doc imported while OCR was disabled or
+    // interrupted mid-job still has candidate pages without OCR text, and
+    // gets its OCR (re)started here. The trigger is "a candidate page has no
+    // OCR text": `ocrTotal === 0` was a wrong proxy that re-launched empty
+    // jobs on every re-import of a finished document.
     if (existing !== undefined && existing.kind === kind && existing.extractor === EXTRACTOR_VERSION) {
-      if (cfg.ocrEnabled && existing.ocrPages.length > 0 && (existing.ocrTotal === 0 || existing.ocrDone < existing.ocrTotal)) {
+      const storedPages = await store.readPages(id)
+      const hasPendingOcr = storedPages !== null
+        && storedPages.some((page) => page.source === 'ocr' && (page.ocrText ?? '').length === 0)
+      if (cfg.ocrEnabled && existing.ocrPages.length > 0 && hasPendingOcr) {
         if (existing.ocrTotal === 0) existing.ocrTotal = existing.ocrPages.length
         await store.writeMeta(existing)
-        ocr.start(id)
+        startOcr(ocr, store, id)
       }
       const text = await store.readText(id)
       const capped = capText(text, cfg.inlineCap)
@@ -110,73 +170,51 @@ async function handleAttach(ctx: Context, cfg: DocImportConfig, store: DocStore,
     if (existing !== undefined && existing.kind === kind) {
       const oldPages = await store.readPages(id)
       if (parsed.pages !== undefined && oldPages !== null) {
-        const oldByN = new Map(oldPages.map((page) => [page.n, page]))
+        const oldByN = pagesByNumber(oldPages)
         for (const page of parsed.pages) {
           const old = oldByN.get(page.n)
           if (page.source === 'ocr' && old?.ocrText !== undefined && old.ocrText.length > 0 && !old.ocrText.startsWith('【')) page.ocrText = old.ocrText
         }
       }
     }
-    const base: DocMeta = existing !== undefined && existing.kind === kind
-      ? {
-          ...existing,
-          name,
-          mediaType,
-          bytes: bytes.length,
-          chars: parsed.text.length,
-          pages: parsed.pages?.length ?? 0,
-          ocrPages: parsed.ocrCandidates,
-          ocrDone: 0,
-          ocrTotal: 0,
-          ocrSkipped: 0,
-          warning: parsed.warnings.join('；'),
-          extractor: EXTRACTOR_VERSION,
-        }
-      : {
-          id,
-          name,
-          kind,
-          mediaType,
-          bytes: bytes.length,
-          chars: parsed.text.length,
-          pages: parsed.pages?.length ?? 0,
-          ocrPages: parsed.ocrCandidates,
-          ocrDone: 0,
-          ocrTotal: 0,
-          ocrSkipped: 0,
-          warning: parsed.warnings.join('；'),
-          createdAt: Date.now(),
-          extractor: EXTRACTOR_VERSION,
-        }
-    await store.save(base, bytes, parsed.text, parsed.pages)
+    const prior = existing !== undefined && existing.kind === kind ? existing : undefined
+    const savedMeta: DocMeta = {
+      id,
+      name,
+      kind,
+      mediaType,
+      bytes: bytes.length,
+      chars: parsed.text.length,
+      pages: parsed.pages?.length ?? 0,
+      ocrPages: parsed.ocrCandidates,
+      ocrDone: 0,
+      ocrTotal: 0,
+      ocrSkipped: 0,
+      warning: parsed.warnings.join('；'),
+      createdAt: prior?.createdAt ?? Date.now(),
+      extractor: EXTRACTOR_VERSION,
+    }
+    await store.save(savedMeta, bytes, parsed.text, parsed.pages)
     if (parsed.ocrCandidates.length > 0 && cfg.ocrEnabled) {
-      base.ocrTotal = parsed.ocrCandidates.length
-      await store.writeMeta(base)
-      ocr.start(id)
+      savedMeta.ocrTotal = parsed.ocrCandidates.length
+      await store.writeMeta(savedMeta)
+      startOcr(ocr, store, id)
     } else if (parsed.ocrCandidates.length > 0) {
-      pushWarning(base, `OCR 已禁用，${parsed.ocrCandidates.length} 个扫描页无文本内容`)
-      await store.writeMeta(base)
+      pushWarning(savedMeta, `OCR 已禁用，${parsed.ocrCandidates.length} 个扫描页无文本内容`)
+      await store.writeMeta(savedMeta)
     }
     const text = await store.readText(id)
     const capped = capText(text, cfg.inlineCap)
-    writeJson(res, 200, { ok: true, doc: attachView(cfg, base, capped.text, capped.truncated) })
+    writeJson(res, 200, { ok: true, doc: attachView(cfg, savedMeta, capped.text, capped.truncated) })
   } catch (error) {
     writeJson(res, 422, { ok: false, error: { code: 'rejected', message: (error as Error).message } })
   }
 }
 
-/** The one cost shape every route and the client agree on. */
-interface CostView {
-  tokens: number
-  cny: number
-  ocrCny: number
-  label: string
-}
-
+/** The one cost shape every route and the client agree on (type lives in cost.ts). */
 function costView(cfg: DocImportConfig, meta: DocMeta, text: string): CostView {
   const inline = inlineCost(text, cfg)
-  const ocrCount = meta.ocrTotal > 0 ? meta.ocrTotal : meta.ocrPages.length
-  const ocrCost = ocrCount > 0 ? ocrPageCost(cfg) : undefined
+  const ocrCost = ocrPageCount(meta) > 0 ? ocrPageCost(cfg) : undefined
   return {
     tokens: inline.tokens,
     cny: inline.cny,
@@ -186,7 +224,6 @@ function costView(cfg: DocImportConfig, meta: DocMeta, text: string): CostView {
 }
 
 function attachView(cfg: DocImportConfig, meta: DocMeta, text: string, truncated: boolean) {
-  const ocrCount = meta.ocrTotal > 0 ? meta.ocrTotal : meta.ocrPages.length
   const ocrNeeded = meta.ocrPages.length > 0 && meta.ocrTotal > 0
   return {
     id: meta.id,
@@ -196,7 +233,7 @@ function attachView(cfg: DocImportConfig, meta: DocMeta, text: string, truncated
     chars: meta.chars,
     pages: meta.pages,
     ocrNeeded,
-    ocrCount,
+    ocrCount: ocrPageCount(meta),
     header: buildDocumentHeader(meta, cfg),
     text,
     truncated,
@@ -217,6 +254,8 @@ export interface DocStatus {
   text?: string
   truncated?: boolean
   warning?: string
+  /** Host-computed poll budget (shared math with the OCR runner); present while OCR is pending. */
+  ocrBudgetMs?: number
 }
 
 async function handleStatus(store: DocStore, cfg: DocImportConfig, ocr: OcrRunner, req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -229,15 +268,16 @@ async function handleStatus(store: DocStore, cfg: DocImportConfig, ocr: OcrRunne
   }
   const done = meta.ocrTotal > 0 && meta.ocrDone >= meta.ocrTotal
   // Self-healing: pending pages with no live job means a previous job was lost
-  // (host restart, killed worker). Restart it so the status always converges
-  // to a terminal phase instead of polling forever.
-  if (meta.ocrTotal > 0 && !done && !ocr.isRunning(id) && cfg.ocrEnabled) {
-    ocr.start(id)
-  }
-  const phase: DocStatus['phase'] = meta.ocrTotal > 0 && !done ? (meta.ocrDone > 0 ? 'ocr' : 'parsing') : 'ready'
-  if (phase === 'ready') {
+  // (host restart, killed worker). Restart it — capped and backed off — so the
+  // status always converges to a terminal phase instead of polling forever.
+  await ensureOcrStarted(store, cfg, ocr, id)
+  const phase: DocStatus['phase'] = meta.ocrFatal !== undefined
+    ? 'error'
+    : meta.ocrTotal > 0 && !done ? (meta.ocrDone > 0 ? 'ocr' : 'parsing') : 'ready'
+  if (phase === 'ready' || phase === 'error') {
     // Full text: the conversation only carries the compact reference, so the
     // preview modal and read_document both need the uncapped extraction here.
+    // An error terminal still carries whatever partial text was extracted.
     const full = await store.readText(id)
     writeJson(res, 200, {
       ok: true,
@@ -267,6 +307,10 @@ async function handleStatus(store: DocStore, cfg: DocImportConfig, ocr: OcrRunne
       chars: meta.chars,
       ocrDone: meta.ocrDone,
       ocrTotal: meta.ocrTotal,
+      // Shared budget math (ocr.ts): clients derive their poll deadline from
+      // the same formula instead of a fixed deadline healthy large jobs
+      // outlive.
+      ocrBudgetMs: estimateOcrBudgetMs(cfg, Math.max(meta.ocrTotal, meta.ocrPages.length)),
       warning: meta.warning.length > 0 ? meta.warning : undefined,
     },
   })
@@ -279,7 +323,7 @@ async function handleStartOcr(store: DocStore, ocr: OcrRunner, req: IncomingMess
     writeJson(res, 404, { ok: false, error: { code: 'missing', message: '文档不存在或已被清理' } })
     return
   }
-  ocr.start(id)
+  startOcr(ocr, store, id)
   writeJson(res, 200, { ok: true, started: true })
 }
 
