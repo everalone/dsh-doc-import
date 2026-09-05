@@ -21,6 +21,14 @@ export interface PdfPageRecord {
   ocrError?: string
 }
 
+/** Typed terminal OCR failure: the self-heal budget was exhausted. */
+export interface OcrFatalState {
+  message: string
+  /** Futile job attempts observed when the budget ran out. */
+  attempts: number
+  at: number
+}
+
 export interface DocMeta {
   id: string
   name: string
@@ -34,8 +42,12 @@ export interface DocMeta {
   ocrDone: number
   ocrTotal: number
   ocrSkipped: number
-  /** Terminal OCR job failure (e.g. self-heal budget exhausted); empty when the job can still converge. */
-  ocrFatal?: string
+  /** Persisted count of OCR jobs that settled without converging; drives the self-heal budget. */
+  ocrRestarts?: number
+  /** Terminal OCR failure (self-heal budget exhausted); explicit re-import or manual retry clears it. */
+  ocrFatal?: OcrFatalState
+  /** Set when the assembled text write failed while pages data is complete; the next trigger regenerates text.txt. */
+  textStale?: boolean
   warning: string
   createdAt: number
   /** Extraction pipeline version that produced the stored text. */

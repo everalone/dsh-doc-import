@@ -21,6 +21,11 @@ const OCR_PROMPT =
 /** Placeholder shown for scanned pages whose OCR text is not (yet) available. */
 const pendingLabel = (n: number): string => `【第 ${n} 页 · 扫描页文本待 OCR】`
 
+/** Total extracted character count over the page records. */
+function recountChars(pages: PdfPageRecord[]): number {
+  return pages.reduce((sum, p) => sum + (p.ocrText ?? p.text).length, 0)
+}
+
 interface VisionChoice {
   message?: { content?: string }
   finish_reason?: string
@@ -101,16 +106,20 @@ async function resolveApiKey(ctx: Context, cfg: DocImportConfig): Promise<string
 }
 
 /**
- * Upper bound for how long one OCR job can legitimately take: every page may
- * spend two attempts, each up to the per-page timeout, spread across the
- * configured concurrency — with a 1.5× scheduling margin plus a one-minute
- * grace. The status route publishes this so clients derive their poll budget
- * from the same math instead of hardcoding a deadline that healthy large jobs
- * blow through (100 pages ≈ 2.2 h worst case, far beyond a fixed 15 min).
+ * Upper bound for how long the remaining pages of one OCR job can legitimately
+ * take: every page may spend two attempts, each up to the per-page timeout.
+ * Parallelism is capped by BOTH the configured concurrency and the page count
+ * (a 1-page job runs alone — dividing by the full concurrency underestimated
+ * its worst case). No upper clamp: with `ocrPageCap = 0` a real job can run
+ * for many hours, and the budget must never be tighter than the honest worst
+ * case or healthy large jobs get killed client-side while the host keeps
+ * paying. Clients refresh the deadline on progress (see client/timing.ts).
  */
 export function estimateOcrBudgetMs(cfg: DocImportConfig, pageCount: number): number {
-  const perRun = pageCount * 2 * cfg.ocrTimeoutMs / Math.max(cfg.ocrConcurrency, 1) * 1.5 + 60_000
-  return Math.min(Math.max(perRun, 60_000), 6 * 3_600_000)
+  const pages = Math.max(pageCount, 1)
+  const parallelism = Math.min(Math.max(cfg.ocrConcurrency, 1), pages)
+  const perRun = pages * 2 * cfg.ocrTimeoutMs / parallelism * 1.5 + 60_000
+  return Math.max(perRun, 60_000)
 }
 
 export interface OcrRunner {
@@ -128,7 +137,9 @@ export interface OcrRunner {
  * status route reaches a terminal state, and persist. A failed text/pages
  * write falls back to a meta-only write — the counters must land somewhere,
  * otherwise a stuck `ocrDone < ocrTotal` combines with the status route's
- * self-heal into a restart loop.
+ * self-heal into a restart loop. When text.txt specifically fails while
+ * pages.json is complete, `textStale` flags the doc so the next trigger
+ * regenerates the text instead of silently serving the stale one.
  */
 async function finalizeOcr(
   store: DocStore,
@@ -136,18 +147,20 @@ async function finalizeOcr(
   pages: PdfPageRecord[],
   meta: DocMeta,
   note: string,
-  markFailed: (page: PdfPageRecord) => void,
+  pageError: string,
 ): Promise<void> {
   for (const page of pages) {
-    if (page.source === 'ocr' && (page.ocrText ?? '').length === 0) markFailed(page)
+    if (page.source === 'ocr' && (page.ocrText ?? '').length === 0) page.ocrError = pageError
   }
   meta.ocrDone = meta.ocrTotal
   pushWarning(meta, note)
-  meta.chars = pages.reduce((sum, p) => sum + ((p.ocrText ?? p.text).length), 0)
+  meta.chars = recountChars(pages)
   try {
     await store.writePages(docId, pages)
     await store.writeText(docId, assemblePdfText(pages, pendingLabel), meta)
+    meta.textStale = false
   } catch {
+    meta.textStale = true
     await store.writeMeta(meta).catch(() => {})
   }
 }
@@ -161,14 +174,27 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
     const cfg = getCfg()
     const pages = await store.readPages(docId)
     if (pages === null) return
-    const byN = new Map(pages.map((page) => [page.n, page]))
+    const byN = pagesByNumber(pages)
     // Failed pages (ocrText empty, ocrError set) come back into the todo list,
     // so re-triggering OCR retries them.
     const todo = pages.filter((p) => p.source === 'ocr' && (p.ocrText ?? '').length === 0).map((p) => p.n)
     if (todo.length === 0) {
-      meta.ocrTotal = 0
-      meta.ocrDone = 0
-      await store.writeMeta(meta)
+      // Nothing left to transcribe (e.g. re-trigger after completion): converge
+      // the counters instead of zeroing them — zeroing made every re-import of
+      // a finished document look unfinished. When a previous text write failed
+      // (textStale), this is also the chance to regenerate text.txt from the
+      // complete pages.json without re-billing a single page.
+      if (meta.ocrTotal > 0 && (meta.ocrDone < meta.ocrTotal || meta.textStale === true)) {
+        meta.ocrDone = meta.ocrTotal
+        meta.chars = recountChars(pages)
+        meta.textStale = false
+        try {
+          await store.writeText(docId, assemblePdfText(pages, pendingLabel), meta)
+        } catch {
+          meta.textStale = true
+          await store.writeMeta(meta).catch(() => {})
+        }
+      }
       return
     }
     // Page cap 0 means "unlimited" (as the settings card promises).
@@ -191,9 +217,7 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
       try {
         apiKey = await resolveApiKey(ctx, cfg)
       } catch (error) {
-        await finalizeOcr(store, docId, pages, meta, `OCR 未执行：${(error as Error).message}`, (page) => {
-          page.ocrError = '未配置 API Key'
-        })
+        await finalizeOcr(store, docId, pages, meta, `OCR 未执行：${(error as Error).message}`, '未配置 API Key')
         return
       }
 
@@ -237,7 +261,7 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
           }
           meta.ocrDone += 1
           const updated = { ...meta }
-          updated.chars = pages.reduce((sum, p) => sum + ((p.ocrText ?? p.text).length), 0)
+          updated.chars = recountChars(pages)
           await store.writePages(docId, pages)
           await store.writeText(docId, assemblePdfText(pages, pendingLabel), updated)
         }
@@ -247,7 +271,7 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
       await Promise.all(workers)
       const finalMeta = { ...store.registry.get(docId) ?? meta }
       finalMeta.ocrDone = finalMeta.ocrTotal
-      finalMeta.chars = pages.reduce((sum, p) => sum + ((p.ocrText ?? p.text).length), 0)
+      finalMeta.chars = recountChars(pages)
       const failedCount = capped.filter((n) => byN.get(n)?.ocrError !== undefined).length
       if (failedCount > 0) {
         pushWarning(finalMeta, `OCR 失败 ${failedCount} 页，重新发送 OCR 请求可重试失败页`)
@@ -258,9 +282,7 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
       // the status route reaches a terminal state instead of hanging clients —
       // failed pages stay retryable through the next /doc-import/ocr POST.
       const message = ((error as Error)?.message ?? String(error)).slice(0, 200)
-      await finalizeOcr(store, docId, pages, meta, `OCR 中断：${message}`, (page) => {
-        page.ocrError = message
-      })
+      await finalizeOcr(store, docId, pages, meta, `OCR 中断：${message}`, message)
     }
   }
 

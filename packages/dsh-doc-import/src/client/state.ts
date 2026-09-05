@@ -7,7 +7,7 @@
  */
 
 import type { CostView } from '../cost.js'
-import { FALLBACK_POLL_BUDGET_MS, POLL_INTERVAL_MS } from './timing.js'
+import { createPollDeadline, FALLBACK_POLL_BUDGET_MS, POLL_INTERVAL_MS } from './timing.js'
 
 export type DraftStatus = 'uploading' | 'parsing' | 'ocr' | 'ready' | 'error'
 
@@ -178,17 +178,15 @@ function createDraft(name: string, kind: string, bytes: number): DraftDoc {
 }
 
 async function pollUntilReady(doc: DraftDoc): Promise<void> {
-  // The host advertises a poll budget sized to the real job (pages × attempts
-  // × timeout ÷ concurrency); a healthy large OCR run can legitimately take
-  // hours, so a fixed deadline would fail sound jobs — and the host keeps
-  // paying while the client has already given up.
-  let deadline: number | null = null
+  // The host advertises a poll budget sized to the remaining pages; the
+  // tracker refreshes it whenever the job makes progress, so healthy slow
+  // runs are never killed while stalled ones eventually surface as errors.
+  const deadline = createPollDeadline(FALLBACK_POLL_BUDGET_MS)
   try {
     for (;;) {
       await sleep(POLL_INTERVAL_MS)
       const response = await postJson<StatusResponse>(`/doc-import/status?id=${encodeURIComponent(doc.id)}`)
       const status = response.doc
-      deadline ??= Date.now() + (status.ocrBudgetMs ?? FALLBACK_POLL_BUDGET_MS)
       doc.ocrDone = status.ocrDone
       doc.ocrTotal = status.ocrTotal
       doc.warning = status.warning
@@ -214,7 +212,7 @@ async function pollUntilReady(doc: DraftDoc): Promise<void> {
       }
       // The host settles every job (self-healing status route), so this is a
       // last-resort guard: never leave a send waiting forever.
-      if (Date.now() > deadline) {
+      if (Date.now() > deadline(status.ocrDone, status.ocrBudgetMs)) {
         doc.status = 'error'
         doc.error = 'OCR 处理超时，已停止等待（文档仍在后台，可稍后在预览中查看）'
         doc.resolveReady()

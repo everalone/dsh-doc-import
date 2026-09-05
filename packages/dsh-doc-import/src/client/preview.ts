@@ -17,8 +17,9 @@
  * @module dsh-doc-import/client/preview
  */
 
+import type { CostView } from '../cost.js'
 import { dictionaries, getDocImportLanguage, type DocImportClientKey } from './locales.js'
-import { PREVIEW_POLL_BUDGET_MS, PREVIEW_POLL_INTERVAL_MS } from './timing.js'
+import { createPollDeadline, PREVIEW_POLL_BUDGET_MS, PREVIEW_POLL_INTERVAL_MS } from './timing.js'
 
 /** Matches one `[document … id: <sha256>]` reference inside message text. */
 const REFERENCE_PATTERN = /\[document ([^\]\n]+?), id: ([0-9a-f]{64})\]/g
@@ -180,8 +181,9 @@ function openModal(docId: string, title: string): void {
     kind: string
     chars: number
     phase?: 'parsing' | 'ocr' | 'ready' | 'error'
+    ocrDone?: number
     text?: string
-    cost?: { label: string }
+    cost?: CostView
     warning?: string
     ocrBudgetMs?: number
   }
@@ -219,10 +221,9 @@ function openModal(docId: string, title: string): void {
 
   /** Poll while OCR is pending so a mid-job open converges instead of sticking on "加载中…". */
   const pollUntilText = async (): Promise<void> => {
-    // Budgeted: prefer the host-advertised `ocrBudgetMs` (shared math with the
-    // OCR runner), fall back to a fixed bound — an unbounded poll loop against
-    // a lost job would spin forever.
-    let deadline: number | null = null
+    // Budgeted via the shared tracker: refreshes on progress, so a healthy
+    // slow job keeps polling while a stalled one eventually shows a failure.
+    const deadline = createPollDeadline(PREVIEW_POLL_BUDGET_MS)
     for (;;) {
       let doc: StatusDoc
       try {
@@ -237,10 +238,9 @@ function openModal(docId: string, title: string): void {
       }
       // Modal closed while polling: stop.
       if (document.querySelector(`[${MODAL_ATTR}]`) === null) return
-      deadline ??= Date.now() + (doc.ocrBudgetMs ?? PREVIEW_POLL_BUDGET_MS)
       render(doc)
       if (doc.text !== undefined) return
-      if (doc.phase === 'error' || Date.now() > deadline) {
+      if (doc.phase === 'error' || Date.now() > deadline(doc.ocrDone ?? 0, doc.ocrBudgetMs)) {
         const failed = document.createElement('div')
         failed.textContent = t('file.failed', { error: doc.warning ?? 'OCR 未能完成' })
         failed.style.cssText = 'color:var(--dsh-alias-label-danger, #e5484d);font-size:13px;'

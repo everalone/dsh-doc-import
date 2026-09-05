@@ -42,32 +42,69 @@ function capText(text: string, cap: number): { text: string; truncated: boolean 
 
 // --- OCR (re)start policy ---------------------------------------------------
 
-/** Self-heal attempts before a repeatedly dying job is declared fatal. */
+/** Futile job settles before a repeatedly failing job is declared fatal. */
 const SELF_HEAL_MAX_ATTEMPTS = 3
 const SELF_HEAL_BACKOFF_MS = 30_000
 
 /**
- * Per-doc self-heal bookkeeping. In-memory by design: a host restart is
- * itself the kind of job loss the self-heal exists to recover from.
+ * In-memory pacing only (one heal attempt per backoff window). Correctness —
+ * the budget itself — lives in `DocMeta.ocrRestarts`, persisted, so a host
+ * restart cannot reset the guard and resume paid restart loops; the memory
+ * map only decides *when* the next attempt may fire.
  */
-const selfHeal = new Map<string, { attempts: number; lastAt: number }>()
+const healPacing = new Map<string, number>()
 
-/** Explicit (re)start from attach or the manual OCR route: clear the fatal marker and retry budget, then kick off. */
-function startOcr(ocr: OcrRunner, store: DocStore, id: string): void {
-  const meta = store.registry.get(id)
-  if (meta !== undefined) {
-    delete meta.ocrFatal
-    selfHeal.delete(id)
-  }
-  const job = ocr.start(id)
-  // A completed job restores the retry budget for the next stall.
-  if (job !== undefined) void job.then(() => { selfHeal.delete(id) })
+/**
+ * Settle accounting for one OCR job. The budget resets ONLY when the document
+ * actually converged — every candidate page has text and the assembled text
+ * is fresh. Any other settle (pending pages, stale text) increments the
+ * persisted counter. Resetting on every settle instead made the cap dead
+ * code: in-process jobs always settle one way or another, so attempts never
+ * passed 1 and `ocrFatal` was unreachable.
+ */
+function monitorOcrJob(store: DocStore, id: string, job: Promise<void>): void {
+  void job.then(async () => {
+    const meta = store.registry.get(id)
+    if (meta === undefined) return
+    const pages = await store.readPages(id)
+    const healthy = meta.textStale !== true
+      && pages !== null
+      && !pages.some((page) => page.source === 'ocr' && (page.ocrText ?? '').length === 0)
+    if (healthy) {
+      if (meta.ocrFatal !== undefined || meta.ocrRestarts !== undefined) {
+        delete meta.ocrFatal
+        meta.ocrRestarts = 0
+        await store.writeMeta(meta).catch(() => {})
+      }
+      return
+    }
+    meta.ocrRestarts = (meta.ocrRestarts ?? 0) + 1
+    await store.writeMeta(meta).catch(() => {})
+  })
 }
 
 /**
- * Self-healing restart for stalled jobs, with a capped, backed-off retry
- * budget. Unguarded, every status poll (700 ms client / 2 s preview) of a
- * job that keeps dying launched a fresh paid OCR run — the hang the
+ * Explicit (re)start from attach or the manual OCR route. Clears the fatal
+ * marker and the restart budget and persists that BEFORE kicking the job off
+ * — clearing only in memory left a fatal flag on disk that a mid-job crash
+ * would resurrect as a stuck `error` document nothing self-heals.
+ */
+async function startOcr(ocr: OcrRunner, store: DocStore, id: string): Promise<void> {
+  const meta = store.registry.get(id)
+  if (meta !== undefined) {
+    delete meta.ocrFatal
+    meta.ocrRestarts = 0
+    healPacing.delete(id)
+    await store.writeMeta(meta).catch(() => {})
+  }
+  const job = ocr.start(id)
+  if (job !== undefined) monitorOcrJob(store, id, job)
+}
+
+/**
+ * Self-healing restart for stalled jobs, with a persisted, capped, backed-off
+ * retry budget. Unguarded, every status poll (700 ms client / 2 s preview) of
+ * a job that keeps dying launched a fresh paid OCR run — the hang the
  * self-heal was meant to remove, resurrected as an infinite billing loop.
  * Past the budget the doc settles into the terminal `error` phase; an
  * explicit re-import or manual OCR call resets the budget.
@@ -75,23 +112,23 @@ function startOcr(ocr: OcrRunner, store: DocStore, id: string): void {
 async function ensureOcrStarted(store: DocStore, cfg: DocImportConfig, ocr: OcrRunner, id: string): Promise<void> {
   const meta = store.registry.get(id)
   if (meta === undefined || !cfg.ocrEnabled || meta.ocrFatal !== undefined) return
-  if (meta.ocrTotal === 0 || meta.ocrDone >= meta.ocrTotal) return
-  const state = selfHeal.get(id) ?? { attempts: 0, lastAt: 0 }
-  if (state.attempts >= SELF_HEAL_MAX_ATTEMPTS) {
-    const message = `OCR 作业连续 ${state.attempts} 次未能完成（可能是存储写入失败），已停止自动重启；重新发送该文档或手动重试可恢复`
-    meta.ocrFatal = message
+  const converged = meta.ocrTotal === 0 || meta.ocrDone >= meta.ocrTotal
+  // A converged doc with stale text still needs a (free, no-API) regen pass.
+  if (converged && meta.textStale !== true) return
+  const restarts = meta.ocrRestarts ?? 0
+  if (restarts >= SELF_HEAL_MAX_ATTEMPTS) {
+    const message = `OCR 作业连续 ${restarts} 次未能收敛（可能存储异常），已停止自动重启；重新发送该文档或手动重试可恢复`
+    meta.ocrFatal = { message, attempts: restarts, at: Date.now() }
     pushWarning(meta, message)
     await store.writeMeta(meta).catch(() => {})
     return
   }
-  const backoff = state.attempts === 0 ? 0 : Math.min(SELF_HEAL_BACKOFF_MS * 2 ** (state.attempts - 1), 300_000)
-  if (Date.now() - state.lastAt < backoff) return
+  const backoff = restarts === 0 ? 0 : Math.min(SELF_HEAL_BACKOFF_MS * 2 ** (restarts - 1), 300_000)
+  const lastAt = healPacing.get(id) ?? 0
+  if (Date.now() - lastAt < backoff) return
+  healPacing.set(id, Date.now())
   const job = ocr.start(id)
-  if (job === undefined) return // a live job is already working; nothing to heal
-  state.attempts += 1
-  state.lastAt = Date.now()
-  selfHeal.set(id, state)
-  void job.then(() => { selfHeal.delete(id) })
+  if (job !== undefined) monitorOcrJob(store, id, job)
 }
 
 /** The `[document …]` header the client inlines above the text. */
@@ -152,10 +189,9 @@ async function handleAttach(ctx: Context, cfg: DocImportConfig, store: DocStore,
       const storedPages = await store.readPages(id)
       const hasPendingOcr = storedPages !== null
         && storedPages.some((page) => page.source === 'ocr' && (page.ocrText ?? '').length === 0)
-      if (cfg.ocrEnabled && existing.ocrPages.length > 0 && hasPendingOcr) {
+      if (cfg.ocrEnabled && existing.ocrPages.length > 0 && (hasPendingOcr || existing.textStale === true)) {
         if (existing.ocrTotal === 0) existing.ocrTotal = existing.ocrPages.length
-        await store.writeMeta(existing)
-        startOcr(ocr, store, id)
+        await startOcr(ocr, store, id)
       }
       const text = await store.readText(id)
       const capped = capText(text, cfg.inlineCap)
@@ -198,7 +234,7 @@ async function handleAttach(ctx: Context, cfg: DocImportConfig, store: DocStore,
     if (parsed.ocrCandidates.length > 0 && cfg.ocrEnabled) {
       savedMeta.ocrTotal = parsed.ocrCandidates.length
       await store.writeMeta(savedMeta)
-      startOcr(ocr, store, id)
+      await startOcr(ocr, store, id)
     } else if (parsed.ocrCandidates.length > 0) {
       pushWarning(savedMeta, `OCR 已禁用，${parsed.ocrCandidates.length} 个扫描页无文本内容`)
       await store.writeMeta(savedMeta)
@@ -310,7 +346,9 @@ async function handleStatus(store: DocStore, cfg: DocImportConfig, ocr: OcrRunne
       // Shared budget math (ocr.ts): clients derive their poll deadline from
       // the same formula instead of a fixed deadline healthy large jobs
       // outlive.
-      ocrBudgetMs: estimateOcrBudgetMs(cfg, Math.max(meta.ocrTotal, meta.ocrPages.length)),
+      // Shared budget math (ocr.ts), sized to the REMAINING pages: clients
+      // refresh their deadline on progress, so this is the no-progress bound.
+      ocrBudgetMs: estimateOcrBudgetMs(cfg, Math.max(ocrPageCount(meta) - meta.ocrDone, 1)),
       warning: meta.warning.length > 0 ? meta.warning : undefined,
     },
   })
@@ -323,7 +361,7 @@ async function handleStartOcr(store: DocStore, ocr: OcrRunner, req: IncomingMess
     writeJson(res, 404, { ok: false, error: { code: 'missing', message: '文档不存在或已被清理' } })
     return
   }
-  startOcr(ocr, store, id)
+  await startOcr(ocr, store, id)
   writeJson(res, 200, { ok: true, started: true })
 }
 
