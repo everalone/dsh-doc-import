@@ -1,7 +1,7 @@
 /**
  * The model-facing read_document tool: returns the full extracted text of an
  * imported document by its id (the id printed in the `[document …]` header of
- * the user message). Used when the inlined text was truncated.
+ * the user message). The primary access path for every imported document.
  * @module dsh-doc-import/tool
  */
 
@@ -10,9 +10,9 @@ import type { DocStore } from './store.js'
 
 const DESCRIPTION_HEAD =
   'Read the full extracted text of a document the user imported through the dsh-doc-import plugin. '
-  + 'Use when a user message contains a `[document …]` header whose text is truncated (the header says '
-  + '内联截断 or 已截断), or when the user asks about a document by name and its full content is not '
-  + 'already visible in the conversation. '
+  + 'Whenever a user message contains a `[document …, id: …]` header, this is THE way to access that '
+  + 'document: call this tool with the id from the header. The id is not a file path — it cannot be '
+  + 'found on disk, so never search the filesystem for it. '
   + 'For long documents, page through with offset: pass offset+chars from the previous call as the '
   + 'next offset until truncated is false (an empty text result means you have reached the end). '
 

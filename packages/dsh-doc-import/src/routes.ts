@@ -47,7 +47,11 @@ export function buildDocumentHeader(meta: DocMeta, cfg: DocImportConfig): string
   parts.push(`${meta.chars} 字符`)
   if (meta.truncated) parts.push(`内联截断至 ${meta.inlineChars} 字符，可用 read_document 回读全文`)
   parts.push(`id: ${meta.id}`)
-  return `[document ${parts.join(', ')}]`
+  const header = `[document ${parts.join(', ')}]`
+  // The id is opaque. A model that misses the read_document tool description
+  // has been observed to treat it as a file path and grep the whole disk for
+  // it (freezing the session) — state the read path right in the message.
+  return header + '\n（如需全文，调用 read_document 工具并传入上面的 id；id 不是文件路径，在磁盘上搜不到。）'
 }
 
 async function handleAttach(ctx: Context, cfg: DocImportConfig, store: DocStore, ocr: OcrRunner, req: IncomingMessage, res: ServerResponse): Promise<void> {

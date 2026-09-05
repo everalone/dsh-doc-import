@@ -20,7 +20,7 @@ export type DocKind = (typeof DOC_KINDS)[number]
  * v3: every PDF page gets a `[第 N 页]` marker; failed OCR pages carry a
  * retryable `ocrError` instead of a permanent ocrText marker.
  */
-export const EXTRACTOR_VERSION = 3
+export const EXTRACTOR_VERSION = 4
 
 export const KIND_LABELS: Record<DocKind, string> = {
   txt: 'txt',
@@ -151,6 +151,21 @@ function parseCsv(bytes: Buffer, cfg: DocImportConfig): ParseResult {
   return { kind: 'csv', text: parts.join('\n'), ocrCandidates: [], warnings }
 }
 
+/**
+ * Clean mammoth markdown output for model consumption: embedded images become
+ * short placeholders (a single logo can be 100KB+ of base64 — pure noise that
+ * makes models degenerate into echoing random strings), empty bookmark
+ * anchors are dropped, and runs of blank lines are collapsed.
+ */
+export function sanitizeDocxMarkdown(raw: string): { text: string; images: number } {
+  let text = raw.replace(/!\[[\s\S]*?\]\(data:[^)]{8,}\)/g, '【图片】')
+  text = text.replace(/data:image\/[a-z+]+;base64,[A-Za-z0-9+/=]{64,}/g, '【图片】')
+  text = text.replace(/<a id="[^"]*"><\/a>/g, '')
+  text = text.replace(/\n{3,}/g, '\n\n')
+  const images = (raw.match(/data:image\/[a-z+]+;base64,/g) ?? []).length
+  return { text, images }
+}
+
 async function parseDocx(bytes: Buffer): Promise<ParseResult> {
   const warnings: string[] = []
   const mammothMarkdown = mammoth as unknown as {
@@ -159,8 +174,14 @@ async function parseDocx(bytes: Buffer): Promise<ParseResult> {
   try {
     const result = await mammothMarkdown.convertToMarkdown({ buffer: bytes })
     for (const message of result.messages.slice(0, 5)) warnings.push(message.message)
-    if (result.value.trim().length === 0) warnings.push('docx 未提取到文本（可能全部为图片）')
-    return { kind: 'docx', text: result.value, ocrCandidates: [], warnings }
+    const { text, images } = sanitizeDocxMarkdown(result.value)
+    if (images > 0) warnings.push(`文档含 ${images} 张内嵌图片，文本中以【图片】占位（图片内容未提取）`)
+    if (text.trim().length === 0 && result.value.trim().length > 0) {
+      warnings.push('docx 除图片外未提取到文本（可能全部为图片）')
+    } else if (result.value.trim().length === 0) {
+      warnings.push('docx 未提取到文本（可能全部为图片）')
+    }
+    return { kind: 'docx', text, ocrCandidates: [], warnings }
   } catch {
     return { kind: 'docx', text: '', ocrCandidates: [], warnings: ['docx 解析失败：文件可能损坏或不是有效的 docx'] }
   }
@@ -223,6 +244,9 @@ const PARSERS: Record<DocKind, Parser> = {
 export async function parseDocument(bytes: Buffer, name: string, mediaType: string, cfg: DocImportConfig): Promise<ParseResult> {
   const kind = detectKind(name, mediaType)
   if (kind === undefined) {
+    if (/\.doc$/i.test(name)) {
+      throw new Error('暂不支持老版 .doc（Word 97-2003）格式：请先在 Word 中另存为 .docx，或导出为 PDF 后再导入')
+    }
     throw new Error(`不支持的文档类型：${name}（支持 ${DOC_KINDS.map((k) => `.${k}`).join(' / ')}）`)
   }
   if (bytes.length === 0) throw new Error('文件为空')

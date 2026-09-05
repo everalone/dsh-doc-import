@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { assemblePdfText, decodeText, detectKind, EXTRACTOR_VERSION, parseDocument } from '../lib/parsers.js'
+import { assemblePdfText, decodeText, detectKind, EXTRACTOR_VERSION, parseDocument, sanitizeDocxMarkdown } from '../lib/parsers.js'
 import { estimateTokens, inlineCost, isPeakBeijing } from '../lib/cost.js'
 import { resolveConfig } from '../lib/config.js'
 import { joinTextItems } from '../lib/pdf.js'
@@ -129,8 +129,30 @@ test('assemblePdfText marks every page and reports OCR errors as retryable', () 
   assert.ok(out.includes('\n\n[第 4 页 · OCR]\n【第 4 页 · OCR 失败：请求超时】'))
 })
 
-test('EXTRACTOR_VERSION bumped to 3 for the page-marker output shape', () => {
-  assert.equal(EXTRACTOR_VERSION, 3)
+test('EXTRACTOR_VERSION bumped to 4 for the docx-de noise output shape', () => {
+  assert.equal(EXTRACTOR_VERSION, 4)
+})
+
+test('sanitizeDocxMarkdown replaces embedded-image data URIs with placeholders', () => {
+  const raw = '<a id="_Hlk1"></a>![徽标\n\nAI 生成的内容可能不正确。](data:image/png;base64,'
+    + 'A'.repeat(200) + ')\n\n\n正文第一段。\n\n![图表](data:image/png;base64,'
+    + 'B'.repeat(100) + ')\n结尾。'
+  const { text, images } = sanitizeDocxMarkdown(raw)
+  assert.equal(images, 2)
+  assert.ok(!text.includes('base64'))
+  assert.ok(!text.includes('<a id='))
+  assert.ok(text.includes('【图片】'))
+  assert.ok(text.includes('正文第一段。'))
+  assert.ok(text.includes('结尾。'))
+  assert.ok(!/\n{3,}/.test(text))
+})
+
+test('sanitizeDocxMarkdown strips stray long base64 leftovers', () => {
+  const raw = '前文 data:image/jpeg;base64,' + 'C'.repeat(100) + ' 后文'
+  const { text, images } = sanitizeDocxMarkdown(raw)
+  assert.equal(images, 1)
+  assert.ok(text.includes('【图片】'))
+  assert.ok(!text.includes('CCCCCC'))
 })
 
 function fakeStore(text) {
