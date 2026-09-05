@@ -18,16 +18,22 @@ const OCR_PROMPT =
   '逐字转录这张扫描页的全部文字，保留原有换行与段落结构，按阅读顺序输出。'
   + '若页面上没有任何文字，只回复 [EMPTY]。只输出页面文字本身，不要任何解释、标题或补充。'
 
-interface VisionResponse {
-  choices?: Array<{ message?: { content?: string } }>
+interface VisionChoice {
+  message?: { content?: string }
+  finish_reason?: string
 }
 
-async function transcribePage(cfg: DocImportConfig, apiKey: string, png: Buffer, signal: AbortSignal): Promise<string> {
+interface VisionResponse {
+  choices?: VisionChoice[]
+}
+
+/** One raw vision-endpoint call: returns the transcription and its finish reason. */
+async function requestTranscription(cfg: DocImportConfig, apiKey: string, png: Buffer, signal: AbortSignal, maxTokens: number): Promise<{ text: string; finishReason: string }> {
   const base = cfg.ocrBaseURL.replace(/\/+$/, '')
   const endpoint = `${base}/chat/completions`
   const body = JSON.stringify({
     model: cfg.ocrModel,
-    max_tokens: cfg.ocrMaxOutputTokens,
+    max_tokens: maxTokens,
     // Transcription needs no chain-of-thought: cut latency and output cost.
     thinking: { type: 'disabled' },
     messages: [
@@ -56,7 +62,21 @@ async function transcribePage(cfg: DocImportConfig, apiKey: string, png: Buffer,
   const payload = (await response.json()) as VisionResponse
   const content = payload.choices?.[0]?.message?.content?.trim() ?? ''
   if (content === '') throw new Error('OCR 端点返回了空内容')
-  return content === '[EMPTY]' ? '' : content
+  return { text: content === '[EMPTY]' ? '' : content, finishReason: payload.choices?.[0]?.finish_reason ?? '' }
+}
+
+/**
+ * Transcribe one page, guarding against silent truncation: when the output
+ * hits the token cap (finish_reason "length"), retry once with a doubled
+ * budget before giving up and flagging the page as possibly truncated.
+ */
+async function transcribePage(cfg: DocImportConfig, apiKey: string, png: Buffer, signal: AbortSignal): Promise<{ text: string; truncated: boolean }> {
+  const first = await requestTranscription(cfg, apiKey, png, signal, cfg.ocrMaxOutputTokens)
+  if (first.finishReason !== 'length') return { text: first.text, truncated: false }
+  const doubled = Math.min(cfg.ocrMaxOutputTokens * 2, 32768)
+  const second = await requestTranscription(cfg, apiKey, png, signal, doubled)
+  if (second.finishReason !== 'length') return { text: second.text, truncated: false }
+  return { text: second.text, truncated: true }
 }
 
 async function resolveApiKey(ctx: Context, cfg: DocImportConfig): Promise<string> {
@@ -85,10 +105,11 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
   async function run(docId: string): Promise<void> {
     const meta = store.registry.get(docId)
     if (meta === undefined) return
-    if (meta.ocrTotal > 0 && meta.ocrDone >= meta.ocrTotal) return
     const cfg = getCfg()
     const pages = await store.readPages(docId)
     if (pages === null) return
+    // Failed pages (ocrText empty, ocrError set) come back into the todo list,
+    // so re-triggering OCR retries them.
     const todo = pages.filter((p) => p.source === 'ocr' && (p.ocrText ?? '').length === 0).map((p) => p.n)
     if (todo.length === 0) {
       meta.ocrTotal = 0
@@ -118,7 +139,7 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
       meta.warning = [meta.warning, `OCR 未执行：${(error as Error).message}`].filter(Boolean).join('；')
       for (const n of capped) {
         const page = pages.find((p) => p.n === n)
-        if (page !== undefined) page.ocrText = `【第 ${n} 页 · OCR 未执行】`
+        if (page !== undefined) page.ocrError = '未配置 API Key'
       }
       meta.ocrDone = meta.ocrTotal
       await store.writePages(docId, pages)
@@ -145,8 +166,13 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
           try {
             const original = await store.readOriginal(docId)
             const png = await renderPagePng(original, n, cfg.ocrImageScale)
-            const text = await transcribePage(cfg, apiKey, png, controller.signal)
-            page.ocrText = text.length === 0 ? '（空白页）' : text
+            const result = await transcribePage(cfg, apiKey, png, controller.signal)
+            page.ocrText = result.text.length === 0 ? '（空白页）' : result.text
+            if (result.truncated) {
+              page.ocrText += '\n\n【OCR 输出达到 token 上限，可能截断】'
+              meta.warning = [meta.warning, `第 ${n} 页 OCR 输出达到 token 上限，可能截断`].filter(Boolean).join('；')
+            }
+            page.ocrError = undefined
             done = true
           } catch (error) {
             lastError = error
@@ -155,7 +181,9 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
           }
         }
         if (!done) {
-          page.ocrText = `【第 ${n} 页 · OCR 失败：${(lastError as Error)?.message ?? String(lastError)}】`
+          // Retryable failure: keep ocrText empty + record ocrError so the
+          // page re-enters the todo list on the next OCR trigger.
+          page.ocrError = String((lastError as Error)?.message ?? lastError).slice(0, 200)
         }
         meta.ocrDone += 1
         const updated = { ...meta }
@@ -170,6 +198,13 @@ export function createOcrRunner(ctx: Context, store: DocStore, getCfg: () => Doc
     const finalMeta = { ...store.registry.get(docId) ?? meta }
     finalMeta.ocrDone = finalMeta.ocrTotal
     finalMeta.chars = pages.reduce((sum, p) => sum + ((p.ocrText ?? p.text).length), 0)
+    const failedCount = capped.filter((n) => {
+      const page = pages.find((p) => p.n === n)
+      return page !== undefined && page.ocrError !== undefined
+    }).length
+    if (failedCount > 0) {
+      finalMeta.warning = [finalMeta.warning, `OCR 失败 ${failedCount} 页，重新发送 OCR 请求可重试失败页`].filter(Boolean).join('；')
+    }
     await store.writeMeta(finalMeta)
   }
 

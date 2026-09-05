@@ -1,9 +1,10 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { decodeText, detectKind, parseDocument } from '../lib/parsers.js'
+import { assemblePdfText, decodeText, detectKind, EXTRACTOR_VERSION, parseDocument } from '../lib/parsers.js'
 import { estimateTokens, inlineCost, isPeakBeijing } from '../lib/cost.js'
 import { resolveConfig } from '../lib/config.js'
 import { joinTextItems } from '../lib/pdf.js'
+import { readDocumentTool } from '../lib/tool.js'
 
 const cfg = resolveConfig()
 
@@ -84,4 +85,89 @@ test('pdf assembly excludes rotated text from line clustering', () => {
   const text = joinTextItems(items)
   assert.ok(text.includes('normal'))
   assert.ok(text.includes('rotated'))
+})
+
+test('CJK runs on the same visual line join without spaces', () => {
+  const items = [
+    { str: '中文', transform: [8.79, 0, 0, 8.79, 48.2, 100], width: 20 },
+    { str: '文档', transform: [8.79, 0, 0, 8.79, 68.2, 100], width: 20 },
+  ]
+  assert.equal(joinTextItems(items), '中文文档')
+})
+
+test('CJK joining keeps Latin boundaries and existing whitespace intact', () => {
+  // Latin/digit boundaries keep the hard space (e.g. "1. 场景建模" above).
+  // Boundary whitespace must not be doubled.
+  const spaced = [
+    { str: 'a ', transform: [1, 0, 0, 1, 0, 100], width: 10 },
+    { str: 'b', transform: [1, 0, 0, 1, 12, 100], width: 10 },
+  ]
+  assert.equal(joinTextItems(spaced), 'a b')
+})
+
+test('CJK joining handles the prepend branch without spaces', () => {
+  // Overlapping widths put the second item left of the running line end:
+  // it is prepended, and the CJK boundary joins with no space.
+  const overlap = [
+    { str: '标题行', transform: [1, 0, 0, 1, 0, 100], width: 90 },
+    { str: '页', transform: [1, 0, 0, 1, 10, 100], width: 10 },
+  ]
+  assert.equal(joinTextItems(overlap), '页标题行')
+})
+
+test('assemblePdfText marks every page and reports OCR errors as retryable', () => {
+  const pages = [
+    { n: 1, source: 'text', text: '第一页正文' },
+    { n: 2, source: 'ocr', text: '', ocrText: '扫描内容' },
+    { n: 3, source: 'ocr', text: '' },
+    { n: 4, source: 'ocr', text: '', ocrError: '请求超时' },
+  ]
+  const out = assemblePdfText(pages, (n) => `【第 ${n} 页 · 扫描页文本待 OCR】`)
+  assert.ok(out.includes('\n\n[第 1 页]\n第一页正文'))
+  assert.ok(out.includes('\n\n[第 2 页 · OCR]\n扫描内容'))
+  assert.ok(out.includes('\n\n[第 3 页 · OCR]\n【第 3 页 · 扫描页文本待 OCR】'))
+  assert.ok(out.includes('\n\n[第 4 页 · OCR]\n【第 4 页 · OCR 失败：请求超时】'))
+})
+
+test('EXTRACTOR_VERSION bumped to 3 for the page-marker output shape', () => {
+  assert.equal(EXTRACTOR_VERSION, 3)
+})
+
+function fakeStore(text) {
+  return {
+    registry: new Map([['d1', { id: 'd1', name: 'doc.pdf' }]]),
+    readText: async () => text,
+  }
+}
+
+test('read_document supports offset paging through long documents', async () => {
+  const full = 'A'.repeat(100) + 'B'.repeat(50)
+  const tool = readDocumentTool(fakeStore(full))
+  const first = await tool.execute({ docId: 'd1', maxChars: 100 })
+  assert.equal(first.chars, 100)
+  assert.equal(first.totalChars, 150)
+  assert.equal(first.truncated, true)
+  const second = await tool.execute({ docId: 'd1', offset: 100, maxChars: 100 })
+  assert.equal(second.text, 'B'.repeat(50))
+  assert.equal(second.chars, 50)
+  assert.equal(second.totalChars, 150)
+  assert.equal(second.truncated, false)
+  const whole = await tool.execute({ docId: 'd1' })
+  assert.equal(whole.text, full)
+  assert.equal(whole.chars, 150)
+  assert.equal(whole.truncated, false)
+})
+
+test('read_document returns empty text past the end', async () => {
+  const tool = readDocumentTool(fakeStore('short'))
+  const tail = await tool.execute({ docId: 'd1', offset: 999 })
+  assert.equal(tail.text, '')
+  assert.equal(tail.chars, 0)
+  assert.equal(tail.totalChars, 5)
+  assert.equal(tail.truncated, false)
+})
+
+test('read_document rejects unknown doc ids', async () => {
+  const tool = readDocumentTool(fakeStore('x'))
+  await assert.rejects(() => tool.execute({ docId: 'ghost' }))
 })

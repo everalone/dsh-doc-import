@@ -17,8 +17,10 @@ export type DocKind = (typeof DOC_KINDS)[number]
  * any parser output shape) changes: re-importing a stored document then
  * re-extracts instead of serving the stale stored text (OCR page results
  * are preserved by page number).
+ * v3: every PDF page gets a `[第 N 页]` marker; failed OCR pages carry a
+ * retryable `ocrError` instead of a permanent ocrText marker.
  */
-export const EXTRACTOR_VERSION = 2
+export const EXTRACTOR_VERSION = 3
 
 export const KIND_LABELS: Record<DocKind, string> = {
   txt: 'txt',
@@ -164,12 +166,26 @@ async function parseDocx(bytes: Buffer): Promise<ParseResult> {
   }
 }
 
-/** Assemble per-page PDF records into the inline text (OCR pages marked until replaced). */
+/**
+ * Assemble per-page PDF records into the inline text. Every page gets a
+ * `[第 N 页]` marker (OCR pages `[第 N 页 · OCR]`) so the model can cite
+ * pages and the reader can spot order problems. Failed OCR pages show a
+ * 【OCR 失败】 body but stay retryable (ocrError set, ocrText empty).
+ */
 export function assemblePdfText(pages: PdfPageRecord[], ocrPendingLabel: (n: number) => string): string {
   return pages
     .map((page) => {
-      const body = page.ocrText ?? (page.source === 'ocr' ? ocrPendingLabel(page.n) : page.text)
-      return `\n\n${page.source === 'ocr' && page.ocrText !== undefined ? `[第 ${page.n} 页 · OCR]` : ''}\n${body}`
+      if (page.source !== 'ocr') {
+        return `\n\n[第 ${page.n} 页]\n${page.text}`
+      }
+      const header = `[第 ${page.n} 页 · OCR]`
+      if (page.ocrText !== undefined && page.ocrText.length > 0) {
+        return `\n\n${header}\n${page.ocrText}`
+      }
+      if (page.ocrError !== undefined && page.ocrError.length > 0) {
+        return `\n\n${header}\n【第 ${page.n} 页 · OCR 失败：${page.ocrError}】`
+      }
+      return `\n\n${header}\n${ocrPendingLabel(page.n)}`
     })
     .join('')
 }

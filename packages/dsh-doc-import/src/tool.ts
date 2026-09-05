@@ -13,6 +13,8 @@ const DESCRIPTION_HEAD =
   + 'Use when a user message contains a `[document …]` header whose text is truncated (the header says '
   + '内联截断 or 已截断), or when the user asks about a document by name and its full content is not '
   + 'already visible in the conversation. '
+  + 'For long documents, page through with offset: pass offset+chars from the previous call as the '
+  + 'next offset until truncated is false (an empty text result means you have reached the end). '
 
 /** Pure pending-state card for one read_document call. */
 export function readDocumentCallView(args: { docId: string }): GenericCallView {
@@ -37,9 +39,13 @@ export function readDocumentTool(store: DocStore): ToolDefinition {
         required: true,
         description: 'The document id from the `[document …, id: …]` header in the user message.',
       },
+      offset: {
+        type: 'integer',
+        description: 'Optional: 0-based character offset to start reading from; use offset+chars of the previous call to continue reading a long document.',
+      },
       maxChars: {
         type: 'integer',
-        description: 'Optional: read only the first N characters of the extracted text.',
+        description: 'Optional: read at most N characters starting at offset (or from the beginning when offset is omitted).',
       },
     },
     output: {
@@ -50,6 +56,7 @@ export function readDocumentTool(store: DocStore): ToolDefinition {
           text: { type: 'string', required: true },
           name: { type: 'string', required: true },
           chars: { type: 'integer', required: true },
+          totalChars: { type: 'integer', required: true },
           truncated: { type: 'boolean', required: true },
         },
       },
@@ -62,13 +69,18 @@ export function readDocumentTool(store: DocStore): ToolDefinition {
       if (meta === undefined) {
         throw new Error(`read_document: no document with id ${args.docId} (it may have been removed or the id is wrong)`)
       }
-      let text = await store.readText(meta.id)
-      let truncated = false
+      const full = await store.readText(meta.id)
+      const totalChars = full.length
+      const offset = args.offset !== undefined && args.offset > 0 ? Math.floor(args.offset) : 0
+      if (offset >= totalChars) {
+        return { text: '', name: meta.name, chars: 0, totalChars, truncated: false }
+      }
+      let text = full.slice(offset)
       if (args.maxChars !== undefined && args.maxChars > 0 && text.length > args.maxChars) {
         text = text.slice(0, args.maxChars)
-        truncated = true
       }
-      return { text, name: meta.name, chars: text.length, truncated }
+      const truncated = offset + text.length < totalChars
+      return { text, name: meta.name, chars: text.length, totalChars, truncated }
     },
   })
 }

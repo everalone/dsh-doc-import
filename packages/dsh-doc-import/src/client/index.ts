@@ -2,12 +2,15 @@
  * Browser half of the dsh-doc-import plugin. Declarative composer surface:
  * the import button (conversation.input.left) and the document chip dock
  * (conversation.input.dock), plus document-level drop/paste listeners, the
- * send-time inline hook, and the settings card the built-in plugin config
- * page dispatches through `settings.plugin.item` (spelled
- * `web-ui.plugin.item` by the web-ui-settings bridge). No DOM hacks:
- * everything rides the slots the shell declares. Failure policy: wiring
- * failures are logged, never thrown — the web shell fails the whole boot
- * when a plugin apply throws.
+ * send-time inline hook, and the settings card. The settings card is
+ * registered twice: under the official keyed slot `settings.plugin.item`
+ * (the built-in plugin config page pairs cards with the host-registered
+ * namespace automatically) and under the community bridge slot
+ * `web-ui.plugin.item` (the dsh-web family's web-ui-settings package, kept
+ * for users who install that bundle). No DOM hacks: everything rides the
+ * slots the shell declares. Failure policy: wiring failures are logged,
+ * never thrown — the web shell fails the whole boot when a plugin apply
+ * throws.
  * @module dsh-doc-import/client
  */
 
@@ -23,7 +26,7 @@ export { NS } from './locales.js'
 interface SlotsRegistry {
   inject(slotName: string, callback: () => void): void
   register(
-    options: { name: string; id?: string; order?: number; locale?: string; inject?: () => () => void },
+    options: { name: string; id?: string; key?: string; order?: number; locale?: string; inject?: () => () => void },
     component: unknown,
   ): () => void
 }
@@ -115,18 +118,45 @@ function applyImpl(ctx: ClientContext): void {
       console.warn('[doc-import] composer surface install failed:', error)
     }
 
-    // Settings card: bind the namespace scope and hand it to the built-in
-    // plugin config page through the web-ui-settings slot bridge.
+    // Settings card: bind the namespace scope once, then hand the same card
+    // to both surfaces — the official plugin config page (keyed slot, pairs
+    // with the host-registered namespace automatically) and the dsh-web
+    // family's web-ui-settings bridge (kept for bundle users). Each
+    // registration is individually failure-tolerant.
     ctx.inject(['settingsScope'], (settingsCtx) => {
       try {
         const binder = settingsCtx.get<SettingsScopeBinder>('webUiSettings') ?? settingsCtx.settingsScope
         if (binder === undefined) return
-        const settingsScope = binder.bind<DocImportSettingsScope>({ namespace: NS })
+        const bound = binder.bind<DocImportSettingsScope>({ namespace: NS })
+        // Normalize to stable closures: the official SettingsScopeController
+        // uses class methods, so detached references (useSyncExternalStore
+        // calls getSnapshot without a receiver) would run with `this`
+        // undefined. The community bridge already returned closures; wrapping
+        // is a no-op for it and mandatory for the official service.
+        const settingsScope: DocImportSettingsScope = {
+          getSnapshot: () => bound.getSnapshot(),
+          subscribe: (listener) => bound.subscribe(listener),
+          set: (field, value) => bound.set(field, value),
+          unset: (field) => bound.unset(field),
+        }
         settingsScopeRef = settingsScope
-        scope.slots.inject('web-ui.plugin.item', () => {
-          const Card = createDocImportSettingsCard(settingsScope)
-          return scope.slots.register({ name: 'web-ui.plugin.item', id: 'doc-import', order: 115, locale: NS }, Card)
-        })
+        const makeCard = () => createDocImportSettingsCard(settingsScope)
+        try {
+          scope.slots.inject('settings.plugin.item', () => {
+            const Card = makeCard()
+            return scope.slots.register({ name: 'settings.plugin.item', key: NS, locale: NS }, Card)
+          })
+        } catch (error) {
+          console.warn('[doc-import] official settings card install failed:', error)
+        }
+        try {
+          scope.slots.inject('web-ui.plugin.item', () => {
+            const Card = makeCard()
+            return scope.slots.register({ name: 'web-ui.plugin.item', id: 'doc-import', order: 115, locale: NS }, Card)
+          })
+        } catch (error) {
+          console.warn('[doc-import] community settings card install failed:', error)
+        }
       } catch (error) {
         console.warn('[doc-import] settings card install failed:', error)
       }

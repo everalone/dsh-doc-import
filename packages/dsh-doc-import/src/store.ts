@@ -16,6 +16,8 @@ export interface PdfPageRecord {
   source: 'text' | 'ocr'
   text: string
   ocrText?: string
+  /** Last OCR failure message; empty ocrText + set ocrError marks a retryable page. */
+  ocrError?: string
 }
 
 export interface DocMeta {

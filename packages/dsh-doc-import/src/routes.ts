@@ -93,13 +93,15 @@ async function handleAttach(ctx: Context, cfg: DocImportConfig, store: DocStore,
     }
     // Fresh parse, or a stored document whose text predates the current
     // extraction pipeline: re-extract now, preserving OCR page results by
-    // page number so upgrading never re-spends OCR money.
+    // page number so upgrading never re-spends OCR money. Old failure/
+    // skip markers (【…】) are not results: leaving them uncopied lets the
+    // retryable OCR path re-run those pages under the current scheme.
     if (existing !== undefined && existing.kind === kind) {
       const oldPages = await store.readPages(id)
       if (parsed.pages !== undefined && oldPages !== null) {
         for (const page of parsed.pages) {
           const old = oldPages.find((candidate) => candidate.n === page.n)
-          if (page.source === 'ocr' && old?.ocrText !== undefined && old.ocrText.length > 0) page.ocrText = old.ocrText
+          if (page.source === 'ocr' && old?.ocrText !== undefined && old.ocrText.length > 0 && !old.ocrText.startsWith('【')) page.ocrText = old.ocrText
         }
       }
       const refreshed: DocMeta = {

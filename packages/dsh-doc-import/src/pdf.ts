@@ -67,6 +67,31 @@ function placeItems(items: TextItemLike[]): PlacedItem[] {
   return placed
 }
 
+/** True when the code point is CJK (ideographs, kana, CJK punctuation, fullwidth forms). */
+function isCJKLike(ch: string): boolean {
+  const code = ch.codePointAt(0) ?? 0
+  return (code >= 0x2e80 && code <= 0x303f)
+    || (code >= 0x3040 && code <= 0x30ff)
+    || (code >= 0x3400 && code <= 0x4dbf)
+    || (code >= 0x4e00 && code <= 0x9fff)
+    || (code >= 0xf900 && code <= 0xfaff)
+    || (code >= 0xff00 && code <= 0xffef)
+}
+
+/**
+ * Separator between two text runs joined on the same visual line: pdfjs
+ * splits runs at font changes, so two adjacent CJK runs must join with no
+ * space (Chinese never uses inter-word spaces), while Latin/digit boundaries
+ * keep a hard space. Empty on either side (or existing whitespace) joins
+ * with nothing.
+ */
+function joinSeparator(left: string, right: string): string {
+  const l = left.length > 0 ? left[left.length - 1] : ''
+  const r = right.length > 0 ? right[0] : ''
+  if (l === '' || r === '' || /\s/.test(l) || /\s/.test(r)) return ''
+  return isCJKLike(l) && isCJKLike(r) ? '' : ' '
+}
+
 /** Cluster placed items into visual lines, independent of stream order. */
 function clusterLines(items: PlacedItem[], tolerance: number): PlacedLine[] {
   const sortable = items.filter((item) => Number.isFinite(item.x))
@@ -79,9 +104,9 @@ function clusterLines(items: PlacedItem[], tolerance: number): PlacedLine[] {
     if (current !== undefined && Math.abs(item.y - current.y) <= tolerance) {
       // Join on the same visual line: insert by x (the sort keeps order).
       if (item.x >= current.xEnd - 0.5) {
-        current.text += ' ' + item.str
+        current.text += joinSeparator(current.text, item.str) + item.str
       } else {
-        current.text = item.str + ' ' + current.text
+        current.text = item.str + joinSeparator(item.str, current.text) + current.text
       }
       current.xEnd = Math.max(current.xEnd, item.xEnd)
       continue
