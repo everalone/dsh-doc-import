@@ -68,8 +68,8 @@ dsh plugin --profile web add link:./packages/dsh-doc-import
 # 重启 dsh web 后生效
 ```
 
-> 若 `dsh plugin` 报既有依赖找不到版本（如 npmmirror 缺 `dsh-dafeiyu@0.1.6`），
-> 追加官方源：`dsh plugin --profile web add link:./packages/dsh-doc-import --registry=https://registry.npmjs.org/`
+> 若 `dsh plugin` 在解析依赖时因默认镜像源缺包而报"找不到版本"，
+> 追加官方源重试：`dsh plugin --profile web add link:./packages/dsh-doc-import --registry=https://registry.npmjs.org/`
 
 OCR 需要视觉模型访问凭证：默认从凭证服务读取 `DEEPSEEK_API_KEY`（可在设置中改用其他
 环境变量 / 端点 / 模型，任何 OpenAI 兼容视觉端点均可）。
