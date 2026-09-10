@@ -9,10 +9,10 @@
 ## 当前状态
 
 - **基准版本**：v1.1（`main` @ `039f1a3`）+ 引用头路径补丁（本次），MIT，仓库 `everalone/dsh-doc-import`
-- **可运行**：host 半 + client 半均完成，本地 `pnpm build` 通过，单测 24 项全绿
+- **可运行**：host 半 + client 半均完成，本地 `pnpm build` 通过，单测 29 项全绿（含客户端草稿持久化回归）
 - **数据**：文档存 `~/.dsh/storages/doc-import/<sha256>/`（`original.bin` / `text.txt` /
   `pages.json` / `meta.json`）；当前 `EXTRACTOR_VERSION = 4`
-- **未验证项**：仅剩**人工观察**——新开梁神会话首轮贴文档，确认模型 `cat <路径>` 而不是全盘 grep。
+- **未验证项**：① 用户硬刷新后复测"贴文档 → 切新对话 → 发送"应带引用；② 人工观察梁神首轮是否 `cat <路径>`。
   （自动部分已验：重启后活体 attach 返回带路径的引用头，该路径可直接 `cat` 出全文；见下方会话日志）
 
 ## 下一步
@@ -32,6 +32,26 @@
 ---
 
 ## 会话日志
+
+### 2026-09-10 · 修复"卡片已就绪但消息里没有引用"（agent，用户报障）
+
+- **现象（真机复现证据）**：用户在梁神会话贴文档 → 卡片显示已就绪 → 发送后模型回答
+  "我没有看到你贴进来的文档"。会话日志（`session-0990eab7…`）显示 user/message 正文**只有**
+  `这个文档说的什么`，`[document …]` 引用行完全没有进入消息；模型 phase 1 只有 bash，
+  只好在仓库里乱翻（5 次 bash 调用，无 read_document）。
+- **根因**：`client/ui.tsx` 的文档坞监听 `sessionId` 变化即 `clearAllDrafts()`——**切到新对话
+  （或页面刷新 / client 模块 HMR 重载导致模块级 store 重置）就把草稿静默清空**，发送时
+  没有引用可加。引用行是模型拿到文档的唯一线索，草稿一丢消息就退化成裸文本。
+- **修复**：删除会话切换清空逻辑（草稿改为**全局**、跨会话可见可发送，仅在发送成功后清 ready 项）；
+  新增 `sessionStorage` 镜像（`toPersistedDrafts`/`fromPersistedDrafts`/`rehydrateDrafts`：
+  只存 id/name/kind/页数字符数/status/header/cost，不存正文；重载后 ready 项即可用，
+  parsing/ocr 项自动续接轮询）；发送合并逻辑抽成纯函数 `documentReferences`/`mergeReferences`；
+  单测新增 `test/client-state.test.mjs`（5 项，含"刷新后仍可发送"与"clearAllDrafts 不得回归"），
+  总数 24 → 29；`test` 脚本同时跑两个文件。
+- **踩坑**：HMR 重建 client 包本身也会重置浏览器里的模块级状态——所以持久化不是"锦上添花"，
+  而是开发期就会触发的高频路径。
+- **下一步**：用户**硬刷新页面**后复测（贴文档 → 切新对话 → 发送，消息应带引用）；
+  仍需人工观察梁神首轮是否 `cat <路径>`。
 
 ### 2026-09-10 · 引用头补"bash 可读路径"（agent）
 

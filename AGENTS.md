@@ -168,6 +168,14 @@ client 半（`src/client/`）：`index.ts` 装配（注册槽位/钩子）、`st
    只写"请调用 read_document"在首轮是空指令，模型会拿 bash 全盘搜 id 把会话卡死。
    反例警告：把 `read_document` 加进预设 `commonTools` 不可取——`tool-bootstrap` 要求
    "恰好一个 shell + 全部 commonTools 在场"，缺任一即把阶段 1 隔离**整体降级为全目录**。
+8. **浏览器端草稿绝不能因切会话/重载而静默消失**：引用行是模型拿到文档的**唯一**线索，
+   草稿一丢消息就退化成"裸文本"，模型只能回答"我没看到文档"（真实事故：卡片显示已就绪，
+   用户切到新对话后发送，消息里没有引用）。
+   - **禁止**在会话切换时清空草稿（旧实现 `clearAllDrafts()` 正是事故原因，已删除并由测试锁死）；
+   - 草稿是**全局**的（跨会话可见、可发送），只在**发送成功后**清除 ready 项；
+   - 页面刷新 / client 模块 HMR 重载会重置模块级状态 → 草稿镜像进 `sessionStorage`
+     （`state.ts` 的 `toPersistedDrafts`/`rehydrateDrafts`；只存 id/header/状态，不存正文；
+     重载后 ready 项直接可用、OCR 中的项自动续接轮询）。
 
 ---
 
