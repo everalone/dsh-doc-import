@@ -12,8 +12,8 @@
 - **可运行**：host 半 + client 半均完成，本地 `pnpm build` 通过，单测 24 项全绿
 - **数据**：文档存 `~/.dsh/storages/doc-import/<sha256>/`（`original.bin` / `text.txt` /
   `pages.json` / `meta.json`）；当前 `EXTRACTOR_VERSION = 4`
-- **未验证项**：引用头路径补丁的**活体人工观察**（新开梁神会话首轮贴文档，确认模型 `cat <路径>`
-  而不是全盘 grep）——需重启 `dsh web` 后进行
+- **未验证项**：仅剩**人工观察**——新开梁神会话首轮贴文档，确认模型 `cat <路径>` 而不是全盘 grep。
+  （自动部分已验：重启后活体 attach 返回带路径的引用头，该路径可直接 `cat` 出全文；见下方会话日志）
 
 ## 下一步
 
@@ -48,6 +48,10 @@
   `C:/...` 形式不会被识别为默认 home（生产用 `resolveDshHome()` 无此问题）。
 - **下一步**：重启 `dsh web` → 新开梁神会话贴文档，人工观察是否 `cat <路径>`；
   然后回到「下一步」第 1 项（复杂页视觉重提取）。
+- **重启后复核（已做）**：新进程 PID 43448（16:29:46 启动）；活体 `POST /doc-import/attach` 返回
+  `（全文获取：优先调用 read_document…否则直接用 bash 读取 ~/.dsh/storages/doc-import/<id>/text.txt…）`，
+  该路径可直接 `cat` 出探针内容；`scripts/verify-live.mjs` 通过。
+  注意：此次重启之前发出的历史消息仍是旧引用头（无路径），需**重新粘贴文档**才生效。
 
 ### 2026-09-10 · 协作基建（agent）
 
