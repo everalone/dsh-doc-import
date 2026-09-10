@@ -8,12 +8,12 @@
 
 ## 当前状态
 
-- **基准版本**：v1.1（`main` @ `039f1a3`），MIT，仓库 `everalone/dsh-doc-import`
-- **可运行**：host 半 + client 半均完成，本地 `pnpm build` 通过，单测 22 项全绿
+- **基准版本**：v1.1（`main` @ `039f1a3`）+ 引用头路径补丁（本次），MIT，仓库 `everalone/dsh-doc-import`
+- **可运行**：host 半 + client 半均完成，本地 `pnpm build` 通过，单测 24 项全绿
 - **数据**：文档存 `~/.dsh/storages/doc-import/<sha256>/`（`original.bin` / `text.txt` /
   `pages.json` / `meta.json`）；当前 `EXTRACTOR_VERSION = 4`
-- **未验证项**：无（最近一轮改动均已构建 + 单测通过；活体验收需 `dsh web` 重启后跑
-  `scripts/verify-live.mjs`）
+- **未验证项**：引用头路径补丁的**活体人工观察**（新开梁神会话首轮贴文档，确认模型 `cat <路径>`
+  而不是全盘 grep）——需重启 `dsh web` 后进行
 
 ## 下一步
 
@@ -32,6 +32,22 @@
 ---
 
 ## 会话日志
+
+### 2026-09-10 · 引用头补"bash 可读路径"（agent）
+
+- **问题**：梁神模式（`~/.dsh/.agent-presets/liangshen/agent.cordis.yml`）阶段 1 只暴露
+  `bash` + `str_replace_editor`，`read_document` 不在目录里；旧的"请调用 read_document"提示
+  在首轮是空指令，模型改为全盘搜 id → 会话卡住（已复现多次）。
+- **做了什么**：`store.ts` 新增 `docTextPath(id)`（默认 home → `~/.dsh/...`；`DSH_HOME` 覆盖 →
+  绝对 posix 路径）；`routes.ts` 的 `buildDocumentHeader()` 第二行改为"优先 read_document，
+  否则 bash 读 <路径>，不要全盘搜 id"；`tool.ts` 描述补充该路径；单测 +2（24 项）；
+  `scripts/e2e-host.mjs` 增加"路径可读且内容与 status 一致"断言；AGENTS.md「已知坑」补第 7 条。
+- **不改**：预设配置（把 read_document 加进 `commonTools` 会让阶段 1 隔离整体降级为全目录）、
+  客户端渲染、`EXTRACTOR_VERSION`。
+- **踩坑**：`dshHomeDisplay()` 是拿传入路径与 `defaultDshHome()` 做**精确比较**，测试里手写
+  `C:/...` 形式不会被识别为默认 home（生产用 `resolveDshHome()` 无此问题）。
+- **下一步**：重启 `dsh web` → 新开梁神会话贴文档，人工观察是否 `cat <路径>`；
+  然后回到「下一步」第 1 项（复杂页视觉重提取）。
 
 ### 2026-09-10 · 协作基建（agent）
 

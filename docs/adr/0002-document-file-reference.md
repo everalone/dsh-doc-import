@@ -39,6 +39,18 @@ ADR 0001 把解析全文内联进用户消息。真实使用（长 PDF）暴露�
   仍不含正文。
 - 内联模式残骸（showCostToast、toast.* 文案、发送钩子阈值参数、package.json 过期描述）
   已在本修订中移除；`inlineCap`/`costNoticeThreshold` 字段按上文"暂时保留"继续保留。
+
+## 修订（2026-09-10）
+
+- 引导语在"调用 read_document"之外，**再补上提取文本的 shell 可读路径**
+  （`~/.dsh/storages/doc-import/<id>/text.txt`，`DSH_HOME` 被覆盖时为绝对 posix 路径）。
+- 原因：锚定类预设（梁神模式 `tool-bootstrap`）在会话首个持久 `tool/call` 之前只暴露
+  `bash` + `str_replace_editor`，`read_document` 不在目录中——此时"请调用 read_document"
+  是空指令，模型只能拿 bash 全盘搜 id，会话再次被冻结。
+- 决策不变：消息仍是"紧凑引用 + 一句引导语"，正文不进消息；bracket 行格式不变，
+  客户端文件卡片与预览正则无需改动。反例记录：把 `read_document` 加进预设 `commonTools`
+  不可取——`tool-bootstrap` 要求"恰好一个 shell + 全部 commonTools 在场"，缺任一即把
+  阶段 1 隔离整体降级为全目录。
 - 决策第 4 条随代码同步：文件卡片上的费用标签（`chip.cost`/`file.cost` locale 键及
   client/ui.tsx 对应渲染）一并删除，费用估算的唯一定位是预览弹窗元信息行
   （`/doc-import/status` 返回的 cost）。

@@ -160,6 +160,14 @@ client 半（`src/client/`）：`index.ts` 装配（注册槽位/钩子）、`st
 5. **GitHub raw 域名在本机可能连不上**（SSL 中断）→ 用 `gh api repos/<owner>/<repo>/contents/<path> --jq .content | base64 -d` 取文件。
 6. **多 agent 协作的典型事故**：本地落后 + 远程被别人推送 + 误用 `reset --hard`。
    规则见上「协作规则」。
+7. **锚定类预设的首轮只有 shell**：梁神模式（`~/.dsh/.agent-presets/liangshen/agent.cordis.yml`：
+   `shellTools: [bash]` + `commonTools: [str_replace_editor]`、`anchorGate: true`、
+   `promotedPresentation: code`）在会话内出现首个持久 `tool/call` 之前**只暴露 bash 与编辑器**，
+   `read_document`/`grep`/`glob` 都不存在。因此**引用头必须自带可读路径**
+   （`~/.dsh/storages/doc-import/<id>/text.txt`，见 `store.ts` 的 `docTextPath()`）——
+   只写"请调用 read_document"在首轮是空指令，模型会拿 bash 全盘搜 id 把会话卡死。
+   反例警告：把 `read_document` 加进预设 `commonTools` 不可取——`tool-bootstrap` 要求
+   "恰好一个 shell + 全部 commonTools 在场"，缺任一即把阶段 1 隔离**整体降级为全目录**。
 
 ---
 
