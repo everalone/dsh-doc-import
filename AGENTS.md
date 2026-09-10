@@ -176,6 +176,13 @@ client 半（`src/client/`）：`index.ts` 装配（注册槽位/钩子）、`st
    - 页面刷新 / client 模块 HMR 重载会重置模块级状态 → 草稿镜像进 `sessionStorage`
      （`state.ts` 的 `toPersistedDrafts`/`rehydrateDrafts`；只存 id/header/状态，不存正文；
      重载后 ready 项直接可用、OCR 中的项自动续接轮询）。
+9. **客户端渲染的两个陷阱**（都真实发生过）：
+   - **原地改对象 + `useSyncExternalStore` = 不重渲染**：store 里 `doc.status = 'ready'` 这类
+     原地更新不会改变数组引用，React 的 `Object.is` 比较直接跳过重渲染——症状是"卡片一直显示
+     导入中，直到用户在输入框敲字才突然变已就绪"。**每次 emit 必须换新引用**（`docs = docs.slice()`）。
+   - **给模型看的文本不要显示在 UI 里**：引用头后面的 `（全文获取：…）` 引导语是模型读路径用的，
+     `preview.ts` 在**渲染层**把它丢掉并挂到文件卡片的 tooltip；消息文本本身不改（会话日志/模型侧
+     仍带该句），卸载时随引用一起还原。
 
 ---
 
