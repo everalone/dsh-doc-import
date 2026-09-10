@@ -19,7 +19,7 @@ host 端解析并存储（扫描版 PDF 自动 OCR），消息里只出现一张
 
 ## 会话开始时必须做
 
-1. 读 [`docs/PROGRESS.md`](./docs/PROGRESS.md) —— 当前进度、下一步、最近的坑
+1. 读 [`docs/PROGRESS.md`](./docs/PROGRESS.md) —— 当前状态、下一步与踩坑清单
 2. 读 [`docs/adr/`](./docs/adr/)（按需读相关的那一篇）—— **已定的架构决策不要推翻**；
    与既有 ADR 冲突的想法，先摆出来问，别直接改
 3. `git status -sb` → `git fetch` → 需要时 `git pull --rebase`（工作区脏就先 commit 或 stash）
@@ -42,6 +42,8 @@ host 端解析并存储（扫描版 PDF 自动 OCR），消息里只出现一张
 - 禁止改 `.env`、锁文件版本、依赖版本（除非用户明确要求）
 - 禁止在两个不同目录/模块重复实现同一个模块或同一份逻辑
 - 禁止 `git reset --hard`、`git push --force`、`git checkout -- .`（未经用户明确要求）
+- 禁止在会话切换 / 页面重载时清空浏览器端草稿（ADR 0003；已知坑第 8 条）——
+  引用行是模型拿到文档的唯一线索，清空等于让那次发送静默失败
 - 禁止提交 `review/`、`lib/`、`node_modules/`（`.gitignore` 是刻意的）
 
 
@@ -103,7 +105,9 @@ packages/dsh-doc-import/
 │   ├── http.ts              # 有界 JSON body 读写 + loopback 围栏
 │   ├── shims/pdfjs.d.ts     # pdfjs 类型垫片
 │   └── client/              # 浏览器半（见下）
-├── test/parsers.test.mjs    # 单测（node --test）
+├── test/                    # 单测（node --test）
+│   ├── parsers.test.mjs      #   host：解析 / 费用 / 顺序 / 工具分页
+│   └── client-state.test.mjs #   client：草稿持久化 / 引用合并 / 引导语 / 快照
 └── lib/                     # 构建产物（不入库）
 scripts/
 ├── build-client.mjs         # esbuild 打包 client（react 外置，交给 ModuleLoader）
@@ -142,6 +146,8 @@ client 半（`src/client/`）：`index.ts` 装配（注册槽位/钩子）、`st
   预算按**剩余页数**推算（见 `ocr.ts` 与 `client/timing.ts`）。
 - **费用护栏**：价格表内置 DeepSeek 官方价（高峰/空闲 × 输入/输出），设置卡可改；
   图片按每页 384 tokens 上限估算。
+- **草稿全局且持久**：待发送文档跨会话保留，并镜像进 `sessionStorage`（ADR 0003）。
+  任何“会话切换即清空草稿”的写法都是回归，见「禁止事项」与已知坑第 8 条。
 
 ---
 
@@ -159,7 +165,7 @@ client 半（`src/client/`）：`index.ts` 装配（注册槽位/钩子）、`st
    否则原生模块不编译。
 5. **GitHub raw 域名在本机可能连不上**（SSL 中断）→ 用 `gh api repos/<owner>/<repo>/contents/<path> --jq .content | base64 -d` 取文件。
 6. **多 agent 协作的典型事故**：本地落后 + 远程被别人推送 + 误用 `reset --hard`。
-   规则见上「协作规则」。
+   规则见上「跨机器 / 跨 agent 协作要点」。
 7. **锚定类预设的首轮只有 shell**：梁神模式（`~/.dsh/.agent-presets/liangshen/agent.cordis.yml`：
    `shellTools: [bash]` + `commonTools: [str_replace_editor]`、`anchorGate: true`、
    `promotedPresentation: code`）在会话内出现首个持久 `tool/call` 之前**只暴露 bash 与编辑器**，
@@ -189,7 +195,7 @@ client 半（`src/client/`）：`index.ts` 装配（注册槽位/钩子）、`st
 ## 测试与验证（改完必须自证）
 
 ```bash
-pnpm test                                          # 单测（当前 22 项）
+pnpm test                                          # 单测（当前 31 项：host 解析/费用/顺序 + client 草稿与渲染）
 node scripts/e2e-host.mjs <某个 PDF 路径>            # 独立服务全链路：attach→OCR→status→read_document→raw
 node scripts/verify-live.mjs                        # 活体验收（需 dsh web 在跑）；未挂载时返回非 0
 ```

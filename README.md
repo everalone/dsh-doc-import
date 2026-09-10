@@ -12,6 +12,11 @@
 
 - **零刷屏的文档呈现** — 消息内联一行紧凑引用，聊天区渲染为文件卡片（图标 + 文件名 +
   页数/字符数），点击弹全文预览，可另开原始文件；底层消息文本不变，会话日志干净。
+- **首轮只有 shell 也能读** — 引用行自带提取文本的磁盘路径
+  （`~/.dsh/storages/doc-import/<id>/text.txt`）。锚定类预设（如「梁神模式」）在首次工具
+  调用前只暴露 bash，此时模型可直接读该文件，不必等 `read_document` 出现。
+- **附件不会悄悄丢** — 待发送的文档卡片跨对话切换保留，页面刷新后也会恢复
+  （`sessionStorage` 镜像），只在发送成功后清除。
 - **扫描版 PDF 自动 OCR** — 无文本层的页面逐页渲染成图，交 DeepSeek 视觉模型转写；
   结果按页持久化，重复导入不重复计费（约 ¥0.003–0.01/页，随页内容长度浮动）。
 - **结构感知的 PDF 文本提取** — pdfjs 文本层 + 视觉坐标排序：行聚类、分栏检测、
@@ -56,8 +61,8 @@
 
 ## 安装
 
-前置：Node 18+、pnpm、官方 DeepSeek Harness（`dsh` CLI）。社区 dsh-web 全家桶
-**可选**，装不装都能用。
+前置：Node `^22.19.0 || >=24.0.0`、pnpm、官方 DeepSeek Harness（`dsh` CLI）。社区 dsh-web
+全家桶**可选**，装不装都能用。
 
 ```bash
 git clone https://github.com/everalone/dsh-doc-import.git
@@ -100,7 +105,7 @@ OCR 需要视觉模型访问凭证：默认从凭证服务读取 `DEEPSEEK_API_K
 
 ```bash
 pnpm build                              # tsc + esbuild（client bundle）
-pnpm test                               # 解析 / 费用 / 顺序算法 / 工具分页单测
+pnpm test                               # 单测：解析 / 费用 / 顺序算法 / 工具分页 / 客户端草稿与渲染
 pnpm watch                              # host 改动热编译（需重启 dsh web）
 pnpm watch:client                       # client 改动热更新（刷新页面即可）
 node scripts/e2e-host.mjs <pdf路径>     # 独立 HTTP 全链路 e2e（解析→OCR→状态→工具→raw）
@@ -122,9 +127,9 @@ packages/dsh-doc-import/
     client/      client 半（导入按钮、dock、拖放、发送钩子、预览、设置卡）
   test/          node:test 单元测试
 docs/
-  adr/           设计决策记录（0002 纯文件引用取代 0001 文本内联）
+  adr/           设计决策记录（0002 纯文件引用取代 0001 文本内联；0003 草稿全局化）
+  PROGRESS.md    进度与交接（会话日志 / 当前状态 / 下一步）
   roadmap.md     路线图（下一步：复杂页视觉重提取）
-  dependency-audit-and-pdf-pipeline.md   依赖审计与 PDF 优化报告
 CONTEXT.md       项目词汇表
 ```
 
