@@ -64,6 +64,6 @@
     "watch": "tsc -p tsconfig.json --watch",
     "watch:client": "node ../../scripts/build-client.mjs --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test test/parsers.test.mjs"
+    "test": "node --test test/parsers.test.mjs test/client-state.test.mjs"
   }
 }

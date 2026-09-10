@@ -6,9 +6,9 @@
  * @module dsh-doc-import/client/ui
  */
 
-import { useEffect, useRef, useSyncExternalStore } from 'react'
+import { useRef, useSyncExternalStore } from 'react'
 import type { CSSProperties, DragEvent, ReactElement } from 'react'
-import { clearAllDrafts, getDrafts, importFiles, isDocFile, removeDraft, subscribeDrafts, type DraftDoc } from './state.js'
+import { getDrafts, importFiles, isDocFile, removeDraft, subscribeDrafts, type DraftDoc } from './state.js'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -113,16 +113,11 @@ function DocChip({ doc, t }: { doc: DraftDoc; t: SlotProps['t'] }): ReactElement
 /** The dock rendered through the conversation.input.dock slot. */
 export function DocDock(props: SlotProps): ReactElement | null {
   const docs = useSyncExternalStore(subscribeDrafts, getDrafts, getDrafts)
-  // Drafts are session-scoped: switching the conversation drops them, so a
-  // document never leaks into an unrelated session's next send.
-  const sessionId = (props.session as { sessionId?: unknown } | undefined)?.sessionId
-  const lastSessionRef = useRef<unknown>(sessionId)
-  useEffect(() => {
-    if (sessionId !== lastSessionRef.current) {
-      lastSessionRef.current = sessionId
-      clearAllDrafts()
-    }
-  }, [sessionId])
+  // Drafts are deliberately NOT session-scoped: they survive a conversation
+  // switch (and a page reload, via the store's sessionStorage mirror) so a
+  // document the user already attached can still be sent from a new chat.
+  // Silently dropping them here once cost a user an entire send: the message
+  // went out without its reference and the model reported "no document".
   if (docs.length === 0) return null
   return (
     <div style={dockStyle}>

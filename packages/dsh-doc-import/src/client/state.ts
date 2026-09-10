@@ -52,7 +52,171 @@ export function isDocFile(file: File): boolean {
 let docs: DraftDoc[] = []
 const listeners = new Set<() => void>()
 
+/** sessionStorage key holding the minimal draft records. */
+const DRAFTS_STORAGE_KEY = 'dsh-doc-import.drafts.v1'
+
+/** Upper bound on persisted records; oldest are dropped first. */
+const MAX_PERSISTED_DRAFTS = 20
+
+/** One JSON-safe draft record: no promises, no extracted text (the host owns it). */
+export interface PersistedDraft {
+  id: string
+  name: string
+  kind: string
+  bytes: number
+  chars: number
+  pages: number
+  status: DraftStatus
+  ocrDone: number
+  ocrTotal: number
+  header: string
+  truncated: boolean
+  warning?: string
+  cost?: { tokens: number; cny: number; ocrCny: number; label: string }
+}
+
+/** Storage face used for persistence (injectable for tests). */
+export interface DraftStorage {
+  getItem(key: string): string | null
+  setItem(key: string, value: string): void
+  removeItem(key: string): void
+}
+
+function draftStorage(): DraftStorage | undefined {
+  try {
+    return typeof sessionStorage === 'undefined' ? undefined : sessionStorage
+  } catch {
+    // Storage can throw when disabled by policy; drafts then live in memory only.
+    return undefined
+  }
+}
+
+function makeReadyHandle(): { ready: Promise<void>; resolveReady: () => void } {
+  let resolveReady: () => void = () => {}
+  const ready = new Promise<void>((resolve) => {
+    resolveReady = resolve
+  })
+  return { ready, resolveReady }
+}
+
+/**
+ * Serialize the drafts worth restoring. In-flight uploads have no id yet, so
+ * they cannot be resumed; everything with an id survives, including a running
+ * OCR job (the host keeps working and the status route resumes the progress).
+ */
+export function toPersistedDrafts(drafts: readonly DraftDoc[]): string {
+  const records: PersistedDraft[] = drafts
+    .filter((doc) => doc.id.length > 0 && !doc.id.startsWith('pending-'))
+    .slice(-MAX_PERSISTED_DRAFTS)
+    .map((doc) => ({
+      id: doc.id,
+      name: doc.name,
+      kind: doc.kind,
+      bytes: doc.bytes,
+      chars: doc.chars,
+      pages: doc.pages,
+      status: doc.status,
+      ocrDone: doc.ocrDone,
+      ocrTotal: doc.ocrTotal,
+      header: doc.header,
+      truncated: doc.truncated,
+      ...(doc.warning === undefined ? {} : { warning: doc.warning }),
+      ...(doc.cost === undefined ? {} : { cost: doc.cost }),
+    }))
+  return JSON.stringify(records)
+}
+
+/** Rebuild drafts from a persisted payload; malformed input restores nothing. */
+export function fromPersistedDrafts(raw: string | null | undefined): DraftDoc[] {
+  if (raw === null || raw === undefined || raw.length === 0) return []
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(parsed)) return []
+  const restored: DraftDoc[] = []
+  for (const value of parsed) {
+    if (typeof value !== 'object' || value === null) continue
+    const record = value as Partial<PersistedDraft>
+    if (typeof record.id !== 'string' || record.id.length === 0) continue
+    if (typeof record.header !== 'string' || record.header.length === 0) continue
+    const status: DraftStatus = record.status === 'parsing' || record.status === 'ocr' || record.status === 'error' || record.status === 'ready'
+      ? record.status
+      : 'ready'
+    const handle = makeReadyHandle()
+    restored.push({
+      id: record.id,
+      name: typeof record.name === 'string' ? record.name : record.id,
+      kind: typeof record.kind === 'string' ? record.kind : '',
+      bytes: typeof record.bytes === 'number' ? record.bytes : 0,
+      chars: typeof record.chars === 'number' ? record.chars : 0,
+      pages: typeof record.pages === 'number' ? record.pages : 0,
+      status,
+      ocrDone: typeof record.ocrDone === 'number' ? record.ocrDone : 0,
+      ocrTotal: typeof record.ocrTotal === 'number' ? record.ocrTotal : 0,
+      header: record.header,
+      text: '',
+      truncated: record.truncated === true,
+      ...(record.warning === undefined ? {} : { warning: record.warning }),
+      ...(record.cost === undefined ? {} : { cost: record.cost }),
+      ready: handle.ready,
+      resolveReady: handle.resolveReady,
+    })
+  }
+  return restored
+}
+
+let lastPersisted = ''
+
+/** Persist the current drafts; identical payloads are not rewritten. */
+function persistDrafts(storage: DraftStorage | undefined = draftStorage()): void {
+  if (storage === undefined) return
+  const payload = toPersistedDrafts(docs)
+  if (payload === lastPersisted) return
+  try {
+    storage.setItem(DRAFTS_STORAGE_KEY, payload)
+    lastPersisted = payload
+  } catch {
+    // A full or disabled storage must never break the composer.
+  }
+}
+
+/**
+ * Restore drafts after a page refresh or a client-module reload, and resume
+ * OCR polling for jobs that were still running. Without this, a reload wipes
+ * the chip (and the model never receives the reference).
+ */
+export function rehydrateDrafts(storage: DraftStorage | undefined = draftStorage()): void {
+  if (storage === undefined || docs.length > 0) return
+  let raw: string | null = null
+  try {
+    raw = storage.getItem(DRAFTS_STORAGE_KEY)
+  } catch {
+    return
+  }
+  const restored = fromPersistedDrafts(raw)
+  if (restored.length === 0) return
+  docs = restored
+  for (const doc of restored) {
+    if (doc.status === 'parsing' || doc.status === 'ocr') {
+      void pollUntilReady(doc)
+    } else {
+      doc.resolveReady()
+    }
+  }
+  emit()
+}
+
+/** Test seam: drop the module-level store and its memoized payload. */
+export function resetDraftsForTest(): void {
+  docs = []
+  lastPersisted = ''
+}
+
 function emit(): void {
+  persistDrafts()
   for (const listener of [...listeners]) listener()
 }
 
@@ -76,13 +240,6 @@ export function clearReadyDrafts(): void {
   const before = docs.length
   docs = docs.filter((d) => d.status !== 'ready')
   if (docs.length !== before) emit()
-}
-
-/** Drop every draft (used when the conversation session changes). */
-export function clearAllDrafts(): void {
-  if (docs.length === 0) return
-  docs = []
-  emit()
 }
 
 function readAsBase64(file: File): Promise<string> {
@@ -155,10 +312,7 @@ interface StatusResponse {
 }
 
 function createDraft(name: string, kind: string, bytes: number): DraftDoc {
-  let resolveReady: () => void = () => {}
-  const ready = new Promise<void>((resolve) => {
-    resolveReady = resolve
-  })
+  const handle = makeReadyHandle()
   return {
     id: `pending-${Math.random().toString(36).slice(2)}`,
     name,
@@ -172,8 +326,8 @@ function createDraft(name: string, kind: string, bytes: number): DraftDoc {
     header: '',
     text: '',
     truncated: false,
-    ready,
-    resolveReady,
+    ready: handle.ready,
+    resolveReady: handle.resolveReady,
   }
 }
 
@@ -279,3 +433,9 @@ export async function importFiles(files: readonly File[]): Promise<void> {
     }
   }
 }
+
+// Restore drafts left by a previous page load (refresh, HMR client reload).
+// A reload must never silently drop a document the user already attached:
+// the reference is the only thing the model gets, and losing it looks like
+// "the file was never sent" from the composer.
+rehydrateDrafts()

@@ -14,13 +14,29 @@
  * @module dsh-doc-import/client/send-hook
  */
 
-import { clearReadyDrafts, getDrafts } from './state.js'
+import { clearReadyDrafts, getDrafts, type DraftStatus } from './state.js'
 import { SEND_WAIT_MS } from './timing.js'
 
 const HOOK_MARKER = '__dshDocImportSendHooked'
 
 interface ConversationSendFace {
   sendSession(session: unknown, text: string, imageIds: readonly string[], mode: string, signal?: AbortSignal): Promise<unknown>
+}
+
+/**
+ * One reference line per ready draft, in draft order; undefined when none is
+ * ready (the caller then passes the send through untouched).
+ */
+export function documentReferences(drafts: readonly { status: DraftStatus; header: string }[]): string | undefined {
+  const ready = drafts.filter((doc) => doc.status === 'ready' && doc.header.length > 0)
+  if (ready.length === 0) return undefined
+  return ready.map((doc) => doc.header).join('\n')
+}
+
+/** Put the references above the user's own text. */
+export function mergeReferences(references: string | undefined, text: string): string {
+  if (references === undefined) return text
+  return references + (text.trim().length > 0 ? `\n\n${text}` : '')
 }
 
 export function installSendHook(
@@ -53,14 +69,13 @@ export function installSendHook(
     if (unsettled > 0) {
       console.warn(`[doc-import] ${unsettled} document(s) still pending after ${SEND_WAIT_MS / 1000}s; sending without their references`)
     }
-    const ready = candidates.filter((doc) => doc.status === 'ready' && doc.header.length > 0)
-    if (ready.length === 0) {
+    const references = documentReferences(candidates)
+    if (references === undefined) {
       return original.call(face, session, text, imageIds, mode, signal)
     }
 
     // Pure file references: one compact line per document, no inlined text.
-    const references = ready.map((doc) => doc.header).join('\n')
-    const merged = references + (text.trim().length > 0 ? `\n\n${text}` : '')
+    const merged = mergeReferences(references, text)
     const outcome = await original.call(face, session, merged, imageIds, mode, signal)
     clearReadyDrafts()
     return outcome
