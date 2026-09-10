@@ -6,7 +6,8 @@ import { resolveConfig } from '../lib/config.js'
 import { joinTextItems } from '../lib/pdf.js'
 import { readDocumentTool } from '../lib/tool.js'
 import { buildDocumentHeader } from '../lib/routes.js'
-import { pushWarning } from '../lib/store.js'
+import { pushWarning, docTextPath } from '../lib/store.js'
+import { defaultDshHome } from '@deepseek-ai/dsh-home-paths'
 
 const cfg = resolveConfig()
 
@@ -216,6 +217,39 @@ test('buildDocumentHeader carries the read guidance and never the dead inline cl
   assert.ok(header.includes('id: ' + 'a'.repeat(64)))
   assert.ok(header.includes('read_document'))
   assert.ok(!header.includes('内联截断'))
+})
+
+test('buildDocumentHeader names the bash-readable text path for shell-only first turns', () => {
+  const id = 'b'.repeat(64)
+  const meta = {
+    id, name: 'doc.pdf', kind: 'pdf', mediaType: 'application/pdf',
+    bytes: 10, chars: 120, pages: 2, ocrPages: [], ocrDone: 0, ocrTotal: 0,
+    ocrSkipped: 0, warning: '', createdAt: 0, extractor: EXTRACTOR_VERSION,
+  }
+  const header = buildDocumentHeader(meta, cfg)
+  assert.ok(header.includes(docTextPath(id)), 'header must carry the extracted text path')
+  assert.ok(header.includes('bash'), 'the fallback must name the shell')
+  assert.ok(header.includes('不要在磁盘上搜索'), 'the anti-grep warning must stay')
+
+  // The chip renderer matches the bracket line only; adding the hint must not
+  // change that line's shape.
+  const bracketLine = header.split('\n')[0]
+  const match = /^\[document ([^\]\n]+?), id: ([0-9a-f]{64})\]$/.exec(bracketLine)
+  assert.ok(match !== null, 'bracket line must keep matching the client reference pattern')
+  assert.equal(match[2], id)
+})
+
+test('docTextPath renders the default home as ~/.dsh and a custom home absolutely', () => {
+  const id = 'c'.repeat(64)
+  // dshHomeDisplay compares against defaultDshHome() exactly, so the default
+  // case must be spelled with that canonical form — the production caller
+  // passes resolveDshHome(), which yields it when DSH_HOME is unset.
+  const defaultHome = docTextPath(id, defaultDshHome())
+  assert.ok(defaultHome.startsWith('~/.dsh/storages/doc-import/'), defaultHome)
+  assert.ok(!defaultHome.includes('\\'), 'path must use posix separators for the shell')
+
+  const customHome = docTextPath(id, 'D:\\custom\\home')
+  assert.equal(customHome, `D:/custom/home/storages/doc-import/${id}/text.txt`)
 })
 
 test('pushWarning joins messages with the canonical separator', () => {

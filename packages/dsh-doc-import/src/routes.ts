@@ -17,7 +17,7 @@ import { isLoopbackRequest, readJsonBody, writeJson } from './http.js'
 import type { DocImportConfig } from './config.js'
 import { estimateOcrBudgetMs, type OcrRunner } from './ocr.js'
 import { detectKind, parseDocument, DOC_KINDS, EXTRACTOR_VERSION, KIND_LABELS, type DocKind } from './parsers.js'
-import { docIdFor, pushWarning, pagesByNumber, ocrPageCount, type DocMeta, type DocStore } from './store.js'
+import { docIdFor, docTextPath, pushWarning, pagesByNumber, ocrPageCount, type DocMeta, type DocStore } from './store.js'
 
 interface AttachPayload {
   data: string
@@ -138,10 +138,18 @@ export function buildDocumentHeader(meta: DocMeta, cfg: DocImportConfig): string
   parts.push(`${meta.chars} 字符`)
   parts.push(`id: ${meta.id}`)
   const header = `[document ${parts.join(', ')}]`
-  // The id is opaque. A model that misses the read_document tool description
-  // has been observed to treat it as a file path and grep the whole disk for
-  // it (freezing the session) — state the read path right in the message.
-  return header + '\n（如需全文，调用 read_document 工具并传入上面的 id；id 不是文件路径，在磁盘上搜不到。）'
+  // The id is opaque. Two observed failure modes drive this hint:
+  //  - a model that misses the tool description treats the id as a file path
+  //    and greps the whole disk for it (freezing the session);
+  //  - an anchored preset (e.g. liangshen) exposes only `bash` plus an editor
+  //    until the session's first tool call, so read_document does not exist
+  //    yet and the tool-only hint is unactionable in that phase.
+  // Naming the extracted text's real path makes the bash-only phase work, and
+  // the tool stays the primary path everywhere else.
+  const textPath = docTextPath(meta.id)
+  return header
+    + '\n（全文获取：优先调用 read_document 并传入上面的 id；若当前工具集里还没有该工具（首轮引导阶段常见），'
+    + `直接用 bash 读取 ${textPath}。id 不是文件路径，不要在磁盘上搜索它。）`
 }
 
 async function handleAttach(ctx: Context, cfg: DocImportConfig, store: DocStore, ocr: OcrRunner, req: IncomingMessage, res: ServerResponse): Promise<void> {

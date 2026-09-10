@@ -9,8 +9,29 @@
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
+import { dshHomeDisplay, dshHomePath, resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import type { DocKind } from './parsers.js'
+
+/**
+ * Bash-readable path of one document's extracted text.
+ *
+ * The message header carries this path so an agent whose toolset does not
+ * include `read_document` yet — the liangshen preset exposes only `bash` plus
+ * `str_replace_editor` until its first tool call promotes the session — can
+ * read the text directly instead of grepping the whole disk for the opaque id.
+ *
+ * The default harness home renders as `~/.dsh` (expanded by the shell); a
+ * configured `DSH_HOME` renders as an absolute path with posix separators,
+ * because the variable itself is not guaranteed to be exported into the shell.
+ * @param id - the document's content-addressed sha256 id.
+ * @param home - resolved harness home (defaults to this machine's home).
+ * @returns the posix path of `text.txt` for that document.
+ */
+export function docTextPath(id: string, home: string = resolveDshHome()): string {
+  const display = dshHomeDisplay(home)
+  const base = display === '$DSH_HOME' ? home.replaceAll('\\', '/') : display
+  return `${base}/storages/doc-import/${id}/text.txt`
+}
 
 export interface PdfPageRecord {
   n: number

@@ -13,6 +13,9 @@ const DESCRIPTION_HEAD =
   + 'Whenever a user message contains a `[document …, id: …]` header, this is THE way to access that '
   + 'document: call this tool with the id from the header. The id is not a file path — it cannot be '
   + 'found on disk, so never search the filesystem for it. '
+  + 'The extracted text is also stored verbatim at ~/.dsh/storages/doc-import/<id>/text.txt, which a '
+  + 'shell can read directly; that path is named in the header for anchored sessions whose first turn '
+  + 'exposes only a shell, but prefer this tool whenever it is available. '
   + 'For long documents, page through with offset: pass offset+chars from the previous call as the '
   + 'next offset until truncated is false (an empty text result means you have reached the end). '
 

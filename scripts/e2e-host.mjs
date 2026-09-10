@@ -8,6 +8,7 @@
  */
 import { createServer } from 'node:http'
 import { readFile, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import * as yaml from 'js-yaml'
 import { apply, parseDocument } from '../packages/dsh-doc-import/lib/index.js'
@@ -122,6 +123,22 @@ if (process.argv[3] !== undefined) {
     name: process.argv[3].split(/[\\/]/).pop(),
   })
   console.log('\n== txt attach:', attachTxt.body.ok, attachTxt.body.doc?.chars, 'chars')
+}
+
+console.log('\n== shell-readable text path (bash-only first turn)')
+const pathMatch = /(~\/\.dsh|\/[^\s、。]*?)\/storages\/doc-import\/([0-9a-f]{64})\/text\.txt/.exec(doc.header)
+if (pathMatch === null) {
+  console.error('header carries no shell path:', doc.header)
+  process.exit(1)
+}
+const shellPath = pathMatch[0].replace(/^~/, homedir())
+const textOnDisk = await readFile(shellPath, 'utf8')
+const statusBody = (await getJson(`/doc-import/status?id=${doc.id}`)).body.doc
+console.log('path in header:', pathMatch[0])
+console.log('file readable:', Buffer.byteLength(textOnDisk), 'bytes | equals status text:', textOnDisk === statusBody.text)
+if (textOnDisk !== statusBody.text) {
+  console.error('MISMATCH: shell path content differs from the status route text')
+  process.exit(1)
 }
 
 console.log('\n== read_document tool')
