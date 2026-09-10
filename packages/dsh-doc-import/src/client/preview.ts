@@ -88,13 +88,29 @@ function t(key: DocImportClientKey, vars?: Record<string, string | number>): str
 
 const CHIP_ATTR = 'data-dsh-docimport-chip'
 
-function buildChip(match: DocumentReferenceMatch): HTMLElement {
+/**
+ * The model-facing guidance line that follows every reference. It must stay in
+ * the message text (the model reads the shell path from it) but must NOT show
+ * up in the transcript — the chip already says everything a human needs, and
+ * the line carries a long absolute path. The matched span is dropped from the
+ * rendered DOM only; the session log keeps the original text.
+ */
+const HINT_PATTERN = /^\n?（全文获取：[^\n]*/
+
+/** The guidance line starting exactly at `from`, when one is there. */
+export function hintAt(text: string, from: number): string | undefined {
+  const match = HINT_PATTERN.exec(text.slice(from))
+  return match === null ? undefined : match[0]
+}
+
+function buildChip(match: DocumentReferenceMatch, hint?: string): HTMLElement {
   const { name, meta } = splitDocumentHead(match.head)
   const button = document.createElement('button')
   button.type = 'button'
   button.setAttribute(CHIP_ATTR, '')
   button.setAttribute('data-dsh-docimport-id', match.id)
-  button.title = `${t('file.open')}: ${name}`
+  // The hidden guidance stays reachable on hover instead of disappearing.
+  button.title = hint === undefined ? `${t('file.open')}: ${name}` : `${t('file.open')}: ${name}\n${hint.trim()}`
   button.style.cssText = [
     'display:inline-flex', 'align-items:center', 'gap:8px',
     'border:1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.3))',
@@ -306,21 +322,33 @@ export function installConversationDocPreview(root?: ParentNode): ConversationDo
     const source = node.textContent
     if (source === null || source.length === 0) return
     const matches = findDocumentReferences(source)
-    if (matches.length === 0) return
+    if (matches.length === 0) {
+      // A hint that landed in its own node (after a chip) is dropped too, so a
+      // re-render can never leave the guidance visible on its own.
+      const leadingHint = hintAt(source, 0)
+      if (leadingHint !== undefined && node.previousSibling instanceof HTMLElement && node.previousSibling.hasAttribute(CHIP_ATTR)) {
+        node.replaceWith(document.createTextNode(source.slice(leadingHint.length)))
+      }
+      return
+    }
     const parent = node.parentNode
     if (parent === null) return
     const fragment = document.createDocumentFragment()
     let cursor = 0
     for (const match of matches) {
       if (match.start > cursor) fragment.append(document.createTextNode(source.slice(cursor, match.start)))
-      const chip = buildChip(match)
+      const hint = hintAt(source, match.end)
+      const end = hint === undefined ? match.end : match.end + hint.length
+      const chip = buildChip(match, hint)
       chip.addEventListener('click', () => {
         const { name } = splitDocumentHead(match.head)
         openModal(match.id, name)
       })
-      replaced.add({ chip, original: source.slice(match.start, match.end) })
+      // Restore the reference AND its hidden hint on dispose, so unloading the
+      // plugin leaves the transcript exactly as the session log has it.
+      replaced.add({ chip, original: source.slice(match.start, end) })
       fragment.append(chip)
-      cursor = match.end
+      cursor = end
     }
     if (cursor < source.length) fragment.append(document.createTextNode(source.slice(cursor)))
     parent.replaceChild(fragment, node)

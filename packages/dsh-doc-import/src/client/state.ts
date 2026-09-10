@@ -217,6 +217,13 @@ export function resetDraftsForTest(): void {
 
 function emit(): void {
   persistDrafts()
+  // Status updates mutate the draft objects in place (doc.status = 'ready',
+  // OCR counters, …), so the array identity would otherwise stay the same and
+  // useSyncExternalStore's Object.is comparison would skip the re-render: the
+  // chip stayed on "导入中" until an unrelated re-render (typing in the
+  // composer) happened to flush the newest values. Rebind on every emit so
+  // subscribers always observe a fresh snapshot.
+  docs = docs.slice()
   for (const listener of [...listeners]) listener()
 }
 
